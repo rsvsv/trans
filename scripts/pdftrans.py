@@ -8,6 +8,7 @@ Subcommands
   pages    PDF OUTDIR --pages 3,5-7 [--grid]                     page renders for review
   trim     IMG [IMG ...] [--out PATH|DIR]  trim margins + cap budget (in place, original kept in .orig/)
   check    PATH                        validate translation(s); PATH = paper folder or library root
+  brief    PATH [--cap-chars N]        reading view: outline (file lines, pages) + abstract + captions + conclusion
   cards    ROOT [--md]                 build ROOT/cards.jsonl (+ cards.md) from YAML headers
 
 Image budget (what the reading model can see without downscaling) is configurable:
@@ -1113,8 +1114,147 @@ def cmd_check(a) -> int:
     return 0 if passed else 1
 
 
+# ----------------------------------------------------------------------------- brief
+ABS_HEAD_RE = re.compile(r"^(?:\d+[.\s]*)?(?:报告)?(摘要|摘\s*要|abstract|summary|要旨|zusammenfassung|résumé|resumen)\s*$", re.I)
+CONCL_HEAD_RE = re.compile(r"结论|結論|总结|結語|结语|conclusion|concluding|まとめ|fazit|schlussfolgerung", re.I)
+NOTICE_LINE_RE = re.compile(r"^\*\*\s*[^*]{0,8}(开放获取|版权|许可|授权|引用本文|出版说明|open access|copyright|licen[cs]e|"
+                            r"citation|publisher'?s note)[^*]{0,8}\*\*", re.I)
+
+
+def _strip_num(t: str) -> str:
+    return re.sub(r"^\s*(?:\d+(?:\.\d+)*\.?|[IVX]+\.)\s*", "", t).strip()
+
+
+def brief_paper(folder: str, a) -> str:
+    """Compact reading view: card facts, outline with file line ranges and pages, abstract, every
+    caption, conclusion. Line numbers are 1-based file lines, usable directly as a Read offset."""
+    mds = translation_file(folder)
+    if not mds:
+        return f"（{os.path.basename(folder)}：没有译稿）"
+    raw = open(os.path.join(folder, mds[0]), "rb").read()
+    text = raw.decode("utf-8", errors="replace").lstrip("﻿").replace("\r\n", "\n")
+    fields, body, off, _ = parse_front_matter(text)
+    lines = body.split("\n")
+    L = lambda i: i + off  # noqa: E731  body index -> file line
+    page, pages = None, []
+    for ln in lines:
+        m = ANCHOR_RE.search(ln)
+        if m:
+            page = int(m.group(1))
+        pages.append(page)
+    P = lambda i: f"p{pages[i]}" if pages[i] else "  "  # noqa: E731
+
+    heads, in_code = [], False
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("```"):
+            in_code = not in_code
+        elif not in_code:
+            m = HEAD_RE.match(ln)
+            if m:
+                heads.append((i, len(m.group(1)), m.group(2).strip()))
+    ref_i = next((i for i, lv, t in heads if lv <= 3 and REF_TITLE_RE.search(t)), None)
+
+    def span(k):  # body index range of heading k's own section (until the next heading of same or higher level)
+        i, lv, _ = heads[k]
+        end = next((j for j, l2, _ in heads[k + 1:] if l2 <= lv), len(lines))
+        return i, end
+
+    def content(i, end):
+        out = [x.strip() for x in lines[i + 1:end] if x.strip() and not ANCHOR_RE.fullmatch(x.strip())
+               and x.strip() not in ("---", "***", "___")
+               and not NOTICE_LINE_RE.match(x.strip())]  # keep structured-abstract labels, drop licence notes
+        return "\n".join(out)
+
+    # facts
+    meta = {LEGACY_KEYS.get(k, k): v for k, v in (fields or {}).items()}
+    for k, v in header_fields(body).items():
+        meta.setdefault(k, v)
+    title = meta.get("title") or next((t for _, lv, t in heads if lv == 1), os.path.basename(folder))
+    out = [f"# {re.sub(r'[*_`]', '', title)}"]
+    src = " · ".join(str(meta[k]) for k in ("venue", "year") if meta.get(k))
+    for lab, val in (("原文", meta.get("title_orig")), ("出处", src), ("DOI", meta.get("doi"))):
+        if val:
+            out.append(f"{lab}：{val}")
+    for k in ("one_liner", "subject", "method", "key_result"):
+        if meta.get(k):
+            out.append(f"{k}：{meta[k]}")
+
+    caps = []
+    stop = ref_i if ref_i is not None else len(lines)
+    for i, ln in enumerate(lines[:stop]):
+        if (CAPLINE_RE.match(ln) or CAPSTART_RE.match(ln)) and not META_LINE_RE.match(ln):
+            caps.append(i)
+    nref = 0
+    if ref_i is not None:
+        k = next(n for n, h in enumerate(heads) if h[0] == ref_i)
+        i, end = span(k)
+        nref = sum(1 for x in lines[i + 1:end] if REF_NUM_RE.match(x) or REF_BULLET_RE.match(x))
+    npages = max((p for p in pages if p), default=0)
+    out.append(f"文件：{os.path.basename(folder)}/{mds[0]} · {L(len(lines) - 1)} 行 · {len(text)} 字符"
+               f"{f' · {npages} 页' if npages else ''} · 图表注 {len(caps)} · 参考文献 {nref}")
+
+    # outline
+    out.append("\n## 目录（文件行号 · 页 · 本节字数）")
+    for k, (i, lv, t) in enumerate(heads):
+        if lv == 1:
+            continue
+        s, e = span(k)
+        n = sum(len(x) for x in lines[s + 1:e])
+        size = f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+        out.append(f"L{L(s)}-{L(e - 1)}  {P(i):>4}  {'  ' * (lv - 2)}{t}  [{size}]")
+
+    # abstract
+    ab = next((k for k, (i, lv, t) in enumerate(heads) if ABS_HEAD_RE.match(_strip_num(t))), None)
+    out.append("\n## 摘要")
+    if ab is None:
+        out.append("（未找到摘要节）")
+    else:
+        i, end = span(ab)
+        out.append(content(i, end))
+
+    # captions
+    out.append("\n## 图表注（行号 · 页）")
+    lim = getattr(a, "cap_chars", 0) or 0
+    for i in caps:
+        c = lines[i].strip()
+        if lim and len(c) > lim:
+            c = c[:lim] + "…"
+        out.append(f"L{L(i)} {P(i)}  {c}")
+    if not caps:
+        out.append("（没有图表注）")
+
+    # conclusion
+    if not getattr(a, "no_conclusion", False):
+        ks = [k for k, (i, lv, t) in enumerate(heads) if lv in (2, 3) and CONCL_HEAD_RE.search(t)
+              and (ref_i is None or i < ref_i)]
+        if ks:
+            i, end = span(ks[-1])
+            out.append(f"\n## {heads[ks[-1]][2]}（L{L(i)}）")
+            out.append(content(i, end))
+    return "\n".join(out)
+
+
+def cmd_brief(a) -> int:
+    path = a.path
+    if os.path.isfile(path):
+        path = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(path):
+        die(f"不是文件夹：{a.path}")
+    papers = list(iter_papers(path))
+    if not papers:
+        die("没找到译稿", 1)
+    rep = ("\n\n" + "=" * 60 + "\n\n").join(brief_paper(f, a) for _, f in papers)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(rep + "\n")
+        print(f"{len(papers)} 篇 -> {a.out}  ({len(rep)} 字符)")
+    else:
+        print(rep)
+    return 0
+
+
 # ----------------------------------------------------------------------------- cards
-CARD_ORDER = ["folder", "title", "title_orig", "authors", "venue", "year", "doi", "type", "field",
+CARD_ORDER =["folder", "title", "title_orig", "authors", "venue", "year", "doi", "type", "field",
               "source_lang", "target_lang", "pages", "figures", "tables", "references",
               "one_liner", "subject", "method", "key_result"]
 HDR_LINE_RE = re.compile(r"^\*\*([^*]{1,16})\*\*\s*[：:]\s*(.+)$")
@@ -1248,6 +1388,13 @@ def main(argv=None) -> int:
     p.add_argument("--no-backup", action="store_true", help="原地覆盖时不备份原图")
     p.add_argument("--pad", type=int, default=8)
     p.set_defaults(fn=cmd_trim)
+
+    p = sub.add_parser("brief", help="速览：目录（行号/页）+ 摘要 + 图表注 + 结论")
+    p.add_argument("path", help="文献文件夹、译稿文件或工作区根目录")
+    p.add_argument("--cap-chars", type=int, default=0, help="每条图表注最多保留的字符数（0 = 全文）")
+    p.add_argument("--no-conclusion", action="store_true")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_brief)
 
     p = sub.add_parser("check", help="校验译稿")
     p.add_argument("path"); budget(p)

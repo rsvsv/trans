@@ -1,6 +1,6 @@
 ---
 name: pdf-paper-translation
-description: 把 PDF 文献（学术论文、综述、技术报告等）全文翻译成结构完整、可逐页核对的 Markdown 译稿，默认译成中文，也可指定其他语言。脚本完成分栏文本提取、配图自动定位裁切、页码锚点、YAML 卡片头和结构校验（漏页、漏图注、参考文献条数、未译句子），多篇时汇总成卡片索引。用户要求翻译 PDF、论文、文献、paper，续译未完成的译稿，批量整理文献译文库，或要把论文转成便于 AI 精读的格式时使用。Use for translating academic PDF papers into faithful, verifiable Markdown.
+description: 把 PDF 文献（学术论文、综述、技术报告等）全文翻译成结构完整、可逐页核对的 Markdown 译稿，默认译成中文，也可指定其他语言。脚本完成分栏文本提取、配图自动定位裁切、页码锚点、YAML 卡片头和结构校验（漏页、漏图注、参考文献条数、未译句子），多篇时汇总成卡片索引。用户要求翻译 PDF、论文、文献、paper，续译未完成的译稿，批量整理文献译文库，要把论文转成便于 AI 精读的格式，或要基于已翻译的文献库做问答、跨文献比较、综述时使用。Use for translating academic PDF papers into faithful, verifiable Markdown, and for reading such a translated library efficiently.
 ---
 
 # PDF 文献翻译
@@ -90,7 +90,27 @@ python <SKILL_DIR>/scripts/pdftrans.py check "<文献文件夹或工作区根目
 python <SKILL_DIR>/scripts/pdftrans.py cards "<工作区根目录>" --md
 ```
 
-每篇一行 JSON，写入 `cards.jsonl`（另有 `cards.md` 表格），内容来自 YAML 头。之后做跨文献比较时，先读 `cards.jsonl`，再按需打开命中译稿的相关章节，不要通读全库。
+每篇一行 JSON，写入 `cards.jsonl`（另有 `cards.md` 表格），内容来自 YAML 头。
+
+## 读已译文献（问答、跨文献比较、写综述）
+
+按由粗到细三层读，每层只在上一层不够用时才往下走：
+
+1. **索引**：先读工作区根目录的 `cards.jsonl`（没有就先跑 `cards`），按 `one_liner / subject / method / key_result` 筛出相关的几篇。
+2. **速览**：对候选文献运行 `python <SKILL_DIR>/scripts/pdftrans.py brief "<文献文件夹>"`。输出卡片信息、带**文件行号和页码**的章节目录（附每节字数）、摘要、全部图表注和结论，约为全文的 15%。科研论文的结果主要集中在图注里，多数问题读到这一层就能回答。
+3. **精读**：需要方法细节、具体数值或原文论证时，按目录里的行号只读那一节（如 `L67-108` → 从第 67 行读 42 行），不要通读全文。
+
+引用数字时注明「文献 + 页码」，页码取自该段之前最近的 `<!-- pN -->`（`brief` 的目录和图注已标出）。要核对译文是否准确，到 `_work/source.txt` 的同页 `<<<PAGE N>>>` 对照原文。
+
+## 给旧译稿补卡片头
+
+没有 YAML 头的旧译稿，`cards` 只能取到标题、出处、年份和 DOI。补写流程如下：
+
+1. 先备份译稿。
+2. 对每篇跑 `brief`。`title_orig / venue / year / doi` 照抄页眉信息块；`one_liner / subject / method / key_result` 依据 brief 撰写，`key_result` 里的每个数字都必须能在译稿正文中原样找到。
+3. 把 YAML 头插到文件最前面，字符串一律加双引号。插完跑 `check`，确认没有 YAML FAIL，再重建 `cards`。
+
+篇数多时按批交给子代理撰写字段，子代理把结果写成 JSON 交回，统一校验数字后再写入文件。子代理不要直接改译稿。
 
 ## 交付时告诉用户
 
@@ -106,6 +126,7 @@ python <SKILL_DIR>/scripts/pdftrans.py cards "<工作区根目录>" --md
 | `render PDF DIR --page N --clip x0,y0,x1,y1 --name fig03` | 手动出图（自动紧裁、按预算放大） |
 | `trim IMG... [--out FILE或DIR]` | 给外来图片去白边、限像素；原地覆盖前把原图备份到 `.orig/` |
 | `check PATH [--strict] [-q] [--log FILE]` | 结构校验；FAIL 时退出码为 1 |
+| `brief PATH [--cap-chars N] [--out FILE]` | 速览：目录（文件行号 · 页 · 字数）+ 摘要 + 图表注 + 结论 |
 | `cards ROOT [--md]` | 卡片索引 |
 
 读图像素预算默认 115 万像素、长边 1568 px，大多数多模态模型在这个尺寸下不会再缩图。如果已知读图模型的上限不同，用 `--max-px / --max-side` 或环境变量 `PDFTRANS_MAX_PX / PDFTRANS_MAX_SIDE` 调整。原理见 `references/figure-spec.md`。

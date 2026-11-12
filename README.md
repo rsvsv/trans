@@ -77,6 +77,7 @@ The CLI is usable on its own:
 | `render PDF DIR --page N --clip x0,y0,x1,y1 --name fig03` | manual crop (auto-trim, budget-aware) |
 | `trim IMG… [--out FILE\|DIR]` | trim margins and cap pixels; in place by default, originals kept in `.orig/` |
 | `check PATH [--strict]` | structural validation; exit code 1 on FAIL |
+| `brief PATH [--cap-chars N]` | reading view: outline with file lines / pages / sizes, abstract, every caption, conclusion (~15% of the text) |
 | `cards ROOT [--md]` | build the card index |
 
 ## Design notes
@@ -96,6 +97,10 @@ structure only — semantic spot-checking is still the model's job.
 
 **No fabrication.** Numeric tables may only contain values explicitly stated in the source. Reading
 values off bar heights or curves is forbidden, and figures are never redrawn.
+
+**Reading a translated library.** Three layers, each only when the previous one is not enough:
+`cards.jsonl` to pick papers → `brief` (outline with file line ranges, abstract, captions, conclusion —
+about 15% of the text; results live mostly in captions) → read only the needed section by line range.
 
 ## Requirements & limits
 
@@ -165,6 +170,8 @@ pip install pymupdf pillow
 - **校验**：漏页、漏图注、图表编号对不上、参考文献编号断裂、疑似未译的外文句子、编码问题、超预算图片。
   只查结构，语义仍需抽查关键数字。
 - **不编数据**：数值表只收原文明确给出的数值，禁止从柱高或曲线估读。
+- **读译文库**：分三层，上一层不够用才往下走。先看 `cards.jsonl` 选文献，再看 `brief`（带行号的目录、摘要、全部图注、结论，
+  约占全文 15%；结果大多在图注里），最后按行号只读需要的那一节。
 
 ### 限制
 

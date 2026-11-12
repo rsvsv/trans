@@ -2,6 +2,18 @@
 
 ## v2.1
 
+### Added: reading a translated library
+
+- `brief PATH`: a compact reading view of one paper (or a whole library): card facts, outline with
+  1-based **file line ranges**, page numbers and section sizes, the abstract, every figure/table caption,
+  and the conclusion. About 15% of the full text on a 38-paper test library (median ~5.9k of ~37.6k
+  characters). Line ranges can be passed straight to a file reader as offset/limit.
+- `SKILL.md` now describes a three-layer reading workflow (cards → brief → section by line range) and a
+  procedure for backfilling YAML headers on legacy translations; the skill description triggers on
+  questions about an existing translated library as well.
+
+### Fixed
+
 Fixes from an external review run against a 38-paper library (all six defects reproduced before fixing).
 
 - `trim` no longer destroys inputs silently: before overwriting a file in place it copies the original to
