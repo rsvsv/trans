@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.zip
+
+# skill outputs, if you happen to run it inside this folder
+_work/
+figures/
+cards.jsonl
+cards.md
