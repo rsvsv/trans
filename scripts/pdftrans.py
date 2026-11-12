@@ -6,7 +6,7 @@ Subcommands
   figures  PDF OUTDIR                 auto-locate and crop every figure -> OUTDIR/figures/
   render   PDF OUTDIR --page N --clip x0,y0,x1,y1 --name fig03   manual crop (PDF points)
   pages    PDF OUTDIR --pages 3,5-7 [--grid]                     page renders for review
-  trim     IMG [IMG ...] [--out PATH]  trim white margins + cap pixel budget (in place)
+  trim     IMG [IMG ...] [--out PATH|DIR]  trim margins + cap budget (in place, original kept in .orig/)
   check    PATH                        validate translation(s); PATH = paper folder or library root
   cards    ROOT [--md]                 build ROOT/cards.jsonl (+ cards.md) from YAML headers
 
@@ -26,7 +26,7 @@ import os
 import re
 import sys
 
-VERSION = "2.0"
+VERSION = "2.1"
 WORK = "_work"
 MAX_PX = int(os.environ.get("PDFTRANS_MAX_PX") or 1_150_000)
 MAX_SIDE = int(os.environ.get("PDFTRANS_MAX_SIDE") or 1568)
@@ -688,9 +688,15 @@ def cmd_pages(a) -> int:
 
 
 def cmd_trim(a) -> int:
+    """Trim + cap budget. In place by default, but the first time a file is touched its original is
+    copied to <dir>/.orig/<name> (hidden from `check`). --out DIR writes elsewhere and never touches inputs."""
     PIL = need_pil()
-    if a.out and len(a.images) > 1:
-        die("--out 只能配合单张图片")
+    import shutil
+    out_dir = None
+    if a.out and (len(a.images) > 1 or os.path.isdir(a.out) or a.out.endswith(("/", "\\"))):
+        out_dir = a.out
+        os.makedirs(out_dir, exist_ok=True)
+    backups = 0
     for src in a.images:
         if not os.path.isfile(src):
             sys.stderr.write(f"skip: 不存在 {src}\n")
@@ -711,11 +717,23 @@ def cmd_trim(a) -> int:
         s = min(1.0, math.sqrt(a.max_px / (im.width * im.height)), a.max_side / max(im.size))
         if s < 1.0:
             im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), PIL.Image.LANCZOS)
-        dst = a.out or src
+        if out_dir:
+            dst = os.path.join(out_dir, os.path.basename(src))
+        else:
+            dst = a.out or src
         if not dst.lower().endswith(".png"):
             dst = os.path.splitext(dst)[0] + ".png"
+        if os.path.abspath(dst) == os.path.abspath(src) and not a.no_backup:
+            bdir = os.path.join(os.path.dirname(os.path.abspath(src)), ".orig")
+            bak = os.path.join(bdir, os.path.basename(src))
+            if not os.path.exists(bak):  # keep the very first original, never overwrite it
+                os.makedirs(bdir, exist_ok=True)
+                shutil.copy2(src, bak)
+                backups += 1
         im.save(dst, "PNG", optimize=True)
         print(f"{os.path.basename(src)}: {w0}x{h0} -> {im.width}x{im.height}  -> {dst}")
+    if backups:
+        print(f"原图已备份 {backups} 张到各自目录下的 .orig/（不需要时可删除；加 --no-backup 跳过备份）")
     return 0
 
 
@@ -723,13 +741,13 @@ def cmd_trim(a) -> int:
 def parse_front_matter(text: str):
     """Return (fields|None, body, body_offset_lines, errors). Values may be quoted or plain."""
     if not text.startswith("---\n"):
-        return None, text, 0, []
+        return None, text, 1, []
     end = text.find("\n---\n", 3)
     if end < 0:
         if text.endswith("\n---"):
             end = len(text) - 4
         else:
-            return None, text, 0, ["YAML 头没有结束的 ---"]
+            return None, text, 1, ["YAML 头没有结束的 ---"]
     raw = text[4:end]
     fields: dict[str, str] = {}
     errs: list[str] = []
@@ -761,7 +779,8 @@ def parse_front_matter(text: str):
     except ImportError:
         pass
     body = text[end + 5:]
-    return fields, body, raw.count("\n") + 3, errs
+    # 1-based file line of body[0]: opening ---, the raw lines, closing ---, then the body
+    return fields, body, raw.count("\n") + 4, errs
 
 
 # ----------------------------------------------------------------------------- check
@@ -770,7 +789,7 @@ ANCHOR_RE = re.compile(r"<!--\s*p\s*(\d+)\s*-->", re.IGNORECASE)
 HEAD_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 REF_TITLE_RE = re.compile(r"参考文献|參考文獻|参考資料|引用文献|references|bibliography|literature cited|works cited|"
                           r"literatur|références|referencias", re.IGNORECASE)
-REF_NUM_RE = re.compile(r"^\s{0,3}(?:\[(\d{1,4})\]|(\d{1,4})[.)])\s+\S")
+REF_NUM_RE = re.compile(r"^\s{0,3}(?:\[(\d{1,4})\]|\((\d{1,4})\)|(\d{1,4})[.)])\s+\S")
 REF_BULLET_RE = re.compile(r"^\s{0,3}[-*+]\s+\S")
 CAPLINE_RE = re.compile(r"^\s*\*\*\s*([^*\d]{0,24}?)\s*(S?\d{1,3})[A-Za-z]?\s*[^*]{0,6}\*\*")
 TABLE_LABEL_RE = re.compile(r"表|table|tab\.?|tabelle|tableau|tabla", re.IGNORECASE)
@@ -780,7 +799,9 @@ LATIN_RUN_RE = re.compile(r"(?:[A-Za-z][A-Za-z'’\-]*[ ,;:]+){10,}[A-Za-z]")
 PLACEHOLDER_RE = re.compile(r"<!--\s*CONT\s*-->|\bTODO\b|\bFIXME\b|待译|待补|未完待续|\[\[TBD\]\]")
 SPECIAL_START = ("#", ">", "|", "```", "<", "![", "---", "$$")
 LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
-TERMINAL_RE = re.compile(r"[。！？…!?：:；;，,、）)」』】》”\"*`_\]$|]$")
+TERMINAL_RE = re.compile(r"[。！？…!?：:；;）)」』】》”\"*`_\]$|]$")  # no commas: a line ending in ，/,/、 is mid-sentence
+# a caption line: bold label + number in any language, or a known unnumbered kind (graphical abstract, TOC)
+CAPSTART_RE = re.compile(r"^\s*\*\*\s*(?:图文摘要|graphical abstract|toc\b|table of contents)", re.IGNORECASE)
 RECOMMENDED = ("title", "title_orig", "venue", "year", "doi", "target_lang", "one_liner")
 LEGACY_KEYS = {"title_zh": "title", "title_en": "title_orig", "journal": "venue"}
 
@@ -855,7 +876,7 @@ def check_paper(folder: str, opts) -> tuple[str, list[tuple[str, str]], dict]:
     for e in errs:
         msgs.append(("FAIL", f"YAML 头：{e}"))
     if fields is None:
-        msgs.append(("WARN", "缺少 YAML 卡片头（cards 索引会退化为从正文猜测）"))
+        msgs.append(("WARN", "缺少 YAML 卡片头（cards 只能从页眉信息块取标题、出处、年份、DOI，没有一句话结论）"))
     else:
         norm = {LEGACY_KEYS.get(k, k): v for k, v in fields.items()}
         miss = [k for k in RECOMMENDED if not norm.get(k)]
@@ -966,7 +987,7 @@ def check_paper(folder: str, opts) -> tuple[str, list[tuple[str, str]], dict]:
         if not m:
             continue
         nxt = [x for x in lines[i + 1:i + 8] if x.strip()][:3]
-        if not any(x.lstrip().startswith("**") for x in nxt):
+        if not any((CAPLINE_RE.match(x) or CAPSTART_RE.match(x)) and not META_LINE_RE.match(x) for x in nxt):
             msgs.append(("FAIL", f"图片后缺图注（**图 N** …）：{m.group(1)}"))
 
     # figure / table coverage against the source captions
@@ -1012,7 +1033,7 @@ def check_paper(folder: str, opts) -> tuple[str, list[tuple[str, str]], dict]:
         lv = next(l for i, l, _ in heads if i == ref_i)
         end = next((i for i, l, _ in heads if i > ref_i and l <= lv), len(lines))
         sect = lines[ref_i + 1:end]
-        nums = [int(m.group(1) or m.group(2)) for m in (REF_NUM_RE.match(x) for x in sect) if m]
+        nums = [int(m.group(1) or m.group(2) or m.group(3)) for m in (REF_NUM_RE.match(x) for x in sect) if m]
         bullets = sum(1 for x in sect if REF_BULLET_RE.match(x))
         count = len(nums) or bullets
         info["refs"] = count
@@ -1096,6 +1117,38 @@ def cmd_check(a) -> int:
 CARD_ORDER = ["folder", "title", "title_orig", "authors", "venue", "year", "doi", "type", "field",
               "source_lang", "target_lang", "pages", "figures", "tables", "references",
               "one_liner", "subject", "method", "key_result"]
+HDR_LINE_RE = re.compile(r"^\*\*([^*]{1,16})\*\*\s*[：:]\s*(.+)$")
+HDR_KEYS = {"title_orig": ("原文标题", "original title", "title"),
+            "venue": ("出处", "期刊出处", "期刊", "来源", "source", "journal", "published in")}
+DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s）)\]>，,；;]+)")
+
+
+def header_fields(body: str) -> dict:
+    """Metadata from the header block (**原文标题**：… / **出处**：… / **DOI**：…) for files whose YAML
+    header is missing or incomplete. Only facts written in the file; one_liner is never synthesised."""
+    f: dict[str, str] = {}
+    for ln in body.split("\n")[:60]:
+        if ln.startswith("## "):
+            break
+        m = HDR_LINE_RE.match(ln.strip())
+        if not m:
+            continue
+        label, val = m.group(1).strip().lower(), m.group(2).strip()
+        for key, labels in HDR_KEYS.items():
+            if label in labels and key not in f:
+                if key == "venue":
+                    it = re.match(r"\*([^*]+)\*", val)
+                    f["venue"] = (it.group(1) if it else re.split(r"[,，(（]", val)[0]).strip()
+                    y = re.search(r"\b(19|20)\d{2}\b", val)
+                    if y:
+                        f.setdefault("year", y.group(0))
+                else:
+                    f[key] = re.sub(r"[*_`]", "", val).strip()
+        if label == "doi":
+            d = DOI_RE.search(val)
+            if d:
+                f.setdefault("doi", d.group(1).rstrip("."))
+    return f
 
 
 def cmd_cards(a) -> int:
@@ -1115,6 +1168,11 @@ def cmd_cards(a) -> int:
         if not card.get("title"):
             m = re.search(r"(?m)^# (.+)$", body)
             card["title"] = re.sub(r"[*_`]", "", m.group(1)).strip() if m else name
+        for k, v in header_fields(body).items():  # fill gaps only; YAML always wins
+            if not str(card.get(k, "")).strip():
+                card[k] = v
+        if not fields:
+            card["source"] = "header-block"  # no YAML: one_liner / subject / method / key_result absent
         _, _, info = check_paper(folder, argparse.Namespace(lang="zh", max_px=MAX_PX, max_side=MAX_SIDE))
         for k, src in (("figures", "figs"), ("tables", "tabs"), ("references", "refs")):
             if not str(card.get(k, "")).strip() and info[src]:
@@ -1184,9 +1242,11 @@ def main(argv=None) -> int:
     p.add_argument("--grid-step", type=int, default=50)
     p.set_defaults(fn=cmd_pages)
 
-    p = sub.add_parser("trim", help="紧裁白边并限制像素（默认原地覆盖）")
+    p = sub.add_parser("trim", help="紧裁白边并限制像素（默认原地覆盖，首次覆盖前把原图备份到 .orig/）")
     p.add_argument("images", nargs="+"); budget(p)
-    p.add_argument("--out"); p.add_argument("--pad", type=int, default=8)
+    p.add_argument("--out", help="输出文件；多张图时为输出目录（不改动原图）")
+    p.add_argument("--no-backup", action="store_true", help="原地覆盖时不备份原图")
+    p.add_argument("--pad", type=int, default=8)
     p.set_defaults(fn=cmd_trim)
 
     p = sub.add_parser("check", help="校验译稿")

@@ -57,7 +57,8 @@ python install.py --zip                   # build a zip for uploading in the Cla
 ```
 
 Keep the directory name `pdf-paper-translation` — it must match `name` in `SKILL.md`.
-Upgrading = run the install again; old files are replaced, never nested.
+Upgrading = run the install again: `scripts/` and `references/` are replaced wholesale (never nested),
+top-level files are overwritten. Files that only existed in an older version's top level are left alone.
 
 Verify: `python scripts/pdftrans.py --version`
 
@@ -74,7 +75,7 @@ The CLI is usable on its own:
 | `figures PDF DIR [--only fig03] [--tables]` | auto-locate and crop every figure + overview sheet |
 | `pages PDF DIR --pages 3,5 [--grid]` | render pages; `--grid` overlays PDF-point coordinates |
 | `render PDF DIR --page N --clip x0,y0,x1,y1 --name fig03` | manual crop (auto-trim, budget-aware) |
-| `trim IMG… [--out]` | trim white margins and cap pixels on external images |
+| `trim IMG… [--out FILE\|DIR]` | trim margins and cap pixels; in place by default, originals kept in `.orig/` |
 | `check PATH [--strict]` | structural validation; exit code 1 on FAIL |
 | `cards ROOT [--md]` | build the card index |
 
@@ -101,6 +102,8 @@ values off bar heights or curves is forbidden, and figures are never redrawn.
 - Python ≥ 3.9, `pymupdf`, `pillow` (`pyyaml` optional, for stricter front-matter validation).
 - Scanned PDFs without a text layer are refused rather than guessed — run OCR first.
 - A rotated or continued caption occasionally needs a manual crop (`pages --grid` then `render`).
+- Older translations without a YAML header still work with `check` and `cards`, but their cards only carry
+  what the header block states (title, original title, venue, year, DOI) — no one-liner or key result.
 
 ## License
 
@@ -146,7 +149,7 @@ pip install pymupdf pillow
 应用不认这个目录名。
 
 或下载后运行 `python install.py --for claude --deps`（DSH 用 `--for dsh`）。
-升级重跑一遍即可，不会嵌套。
+升级重跑一遍即可：`scripts/`、`references/` 整体替换（不会嵌套），根目录文件覆盖；旧版根目录里独有的文件不会被删。
 
 ### 用法
 
@@ -167,6 +170,11 @@ pip install pymupdf pillow
 
 扫描件没有文字层时会直接停下来问，不会凭页面图片编内容；个别旋转图注或续图需要手动出图
 （`pages --grid` 看坐标，再 `render`）。
+
+没有 YAML 头的旧译稿仍可运行 `check` 和 `cards`，但卡片只有页眉信息块里写明的字段（标题、原文标题、出处、
+年份、DOI），没有一句话结论和关键结果。
+
+`trim` 默认原地覆盖，首次覆盖前把原图备份到同目录的 `.orig/`；用 `--out 目录` 可输出到别处、完全不动原图。
 
 ### 许可
 

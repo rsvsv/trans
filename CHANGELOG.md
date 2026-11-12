@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.1
+
+Fixes from an external review run against a 38-paper library (all six defects reproduced before fixing).
+
+- `trim` no longer destroys inputs silently: before overwriting a file in place it copies the original to
+  `<dir>/.orig/<name>` (first time only; `--no-backup` to skip). `--out DIR` now works with many images
+  and leaves the inputs untouched.
+- `cards` fills missing fields from the header block (`**原文标题**` / `**出处**` / `**DOI**`), so
+  legacy translations without YAML get title, original title, venue, year and DOI. A one-liner is never
+  synthesised from the abstract; such cards are marked `"source": "header-block"`.
+- `check`: reference lists numbered `(1)` were reported as "no entries".
+- `check`: any bold line after an image counted as its caption (e.g. `**关键词**：…`). Now it must be a
+  real caption — bold label plus number in any language, or an unnumbered graphical abstract / TOC.
+- `check`: Chinese hard wraps ending in `，`/`、` were missed.
+- `check`: line numbers in warnings were one too low.
+- Docs: exit code 4 is only for a PDF with no text layer at all; partially scanned PDFs exit 0 with a
+  warning, and both cases stop for OCR. Upgrade and legacy-compatibility wording made precise.
+
+Not changed: the trim threshold for dark images (no evidence of over-cropping, and the PDF-rendered crops
+sit on white page background) and an `img`/`fig` filename prefix option (re-running `figures` on an old
+folder is a regeneration; the "unreferenced file" warning is correct).
+
 ## v2.0
 
 Rewritten from `pdf文献翻译_skill_v1.0` to be general-purpose: any platform that loads

@@ -37,7 +37,7 @@ python <SKILL_DIR>/scripts/pdftrans.py extract "<PDF>" "<文献文件夹>"
 - `_work/source.txt`：按 `<<<PAGE n>>>` 分页。已按分栏排好阅读顺序，每段一行，断词连字符已还原，上下标已还原成 Unicode（`10⁸`、`mL⁻¹`、`H₂O₂`）。**翻译只读这个文件**，不要逐页读 PDF 图片。
 - `_work/manifest.json`：页数、每页字数、图表图注清单、参考文献条数估计。后面的校验会用到它。
 
-如果提示扫描页或没有文字层（退出码 4），停下来问用户是否先做 OCR，**绝不凭页面图片编内容**。如果某页文字顺序明显错乱，用 `pages --pages N` 渲染该页，看图确认顺序。
+整份 PDF 没有文字层时退出码为 4；只有部分页没有文字层时退出码仍是 0，但会打印 `WARNING: 疑似扫描页` 并列出页码。两种情况都要停下来问用户是否先做 OCR，**绝不凭页面图片编内容**。如果某页文字顺序明显错乱，用 `pages --pages N` 渲染该页，看图确认顺序。
 
 ## 第 2 步：出图（`none` 档跳过）
 
@@ -104,7 +104,7 @@ python <SKILL_DIR>/scripts/pdftrans.py cards "<工作区根目录>" --md
 | `figures PDF DIR [--only fig03] [--pages 5-7] [--tables]` | 自动出图 + 总览图 |
 | `pages PDF DIR --pages 3,5 [--grid]` | 渲染页面；`--grid` 叠加 PDF 坐标网格 |
 | `render PDF DIR --page N --clip x0,y0,x1,y1 --name fig03` | 手动出图（自动紧裁、按预算放大） |
-| `trim IMG... [--out]` | 给外来图片去白边、限像素 |
+| `trim IMG... [--out FILE或DIR]` | 给外来图片去白边、限像素；原地覆盖前把原图备份到 `.orig/` |
 | `check PATH [--strict] [-q] [--log FILE]` | 结构校验；FAIL 时退出码为 1 |
 | `cards ROOT [--md]` | 卡片索引 |
 
