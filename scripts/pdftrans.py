@@ -2,14 +2,20 @@
 """pdftrans - helper CLI for the pdf-paper-translation skill (single file, cross-platform).
 
 Subcommands
-  extract  PDF OUTDIR                 page text + manifest  -> OUTDIR/_work/
+  extract  PDF OUTDIR                 page text + refs.md + manifest  -> OUTDIR/_work/
   figures  PDF OUTDIR                 auto-locate and crop every figure -> OUTDIR/figures/
   render   PDF OUTDIR --page N --clip x0,y0,x1,y1 --name fig03   manual crop (PDF points)
   pages    PDF OUTDIR --pages 3,5-7 [--grid]                     page renders for review
   trim     IMG [IMG ...] [--out PATH|DIR]  trim margins + cap budget (in place, original kept in .orig/)
+  anchor   PATH [--dry-run] [--auto]   verify page anchors against source.txt; fix only on strong evidence
   check    PATH                        validate translation(s); PATH = paper folder or library root
-  brief    PATH [--cap-chars N]        reading view: outline (file lines, pages) + abstract + captions + conclusion
-  cards    ROOT [--md]                 build ROOT/cards.jsonl (+ cards.md) from YAML headers
+  brief    PATH [--cap-chars N] [--toc-only]  reading view: outline (file lines, pages) + abstract + captions + conclusion
+  cards    ROOT [--md] [--list [--with F,..]]  build ROOT/cards.jsonl (+ cards.md); --list prints a compact table
+  find     ROOT PATTERN [--and P] [--not P] [--scope para|section|paper] [--in zh,src,cards]
+                                       library search, grouped by paper, translation and source together
+  pair     PATH --page N | --line L | --sample K   source page next to its translation (spot checks)
+  wrap     PATH [--dry-run]            wrap lines over 1,500 characters at sentence ends (text unchanged)
+  refresh  ROOT [--dry-run] [--pdf-dir DIR]  re-extract _work/ made by an older version (translations untouched)
 
 Image budget (what the reading model can see without downscaling) is configurable:
   --max-px / --max-side, or env PDFTRANS_MAX_PX / PDFTRANS_MAX_SIDE.
@@ -25,9 +31,11 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
+from collections import Counter, defaultdict
 
-VERSION = "2.1"
+VERSION = "3.2"
 WORK = "_work"
 MAX_PX = int(os.environ.get("PDFTRANS_MAX_PX") or 1_150_000)
 MAX_SIDE = int(os.environ.get("PDFTRANS_MAX_SIDE") or 1568)
@@ -118,6 +126,8 @@ def join_lines(text: str) -> str:
             out = ln
         elif re.search(f"[{CJK}]$", out) and re.match(f"[{CJK}]", ln):
             out += ln
+        elif re.search(r"[A-Za-zα-ω]-$", out) and re.match(r"[a-z]", ln):
+            out += ln  # word broken at line end: rejoin, keep the hyphen (glycer-ophosphate / cell-based)
         else:
             out += " " + ln
     return out
@@ -181,6 +191,11 @@ class TB:
 
 SUP = str.maketrans("0123456789+-−–=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻⁻⁼⁽⁾ⁿ")
 SUB = str.maketrans("0123456789+-−=()", "₀₁₂₃₄₅₆₇₈₉₊₋₋₌₍₎")
+# Symbol-encoded fonts without a ToUnicode map put Greek glyphs on ASCII codes ("b-TCP" = β-TCP,
+# "150 mm" = 150 μm, "2q" = 2θ). Only ASCII letters inside such fonts are remapped (Adobe Symbol encoding).
+SYMFONT_RE = re.compile(r"symbol|^AdvPS", re.I)  # verified mappings only; TeX CMMI etc. hold Latin italics
+GREEK = str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEGHIKLMNOPQRSTUWXYZ",
+                      "αβχδεφγηιϕκλμνοπθρστυϖωξψζΑΒΧΔΕΓΗΙΚΛΜΝΟΠΘΡΣΤΥΩΞΨΖ")
 
 
 def _script(text: str, table: dict) -> str | None:
@@ -190,8 +205,9 @@ def _script(text: str, table: dict) -> str | None:
     return None
 
 
-def page_blocks(fitz, page) -> list[TB]:
-    """Text blocks with superscripts / subscripts restored as Unicode (10⁸, mL⁻¹, H₂O₂).
+def page_blocks(fitz, page, fixes: list | None = None) -> list[TB]:
+    """Text blocks with superscripts / subscripts restored as Unicode (10⁸, mL⁻¹, H₂O₂) and Greek
+    letters from symbol-encoded fonts restored (β-TCP, μm). Each Greek fix is appended to `fixes`.
 
     PDF text layers put raised digits on the baseline ("10 8" -> "108"), which silently changes
     numbers by orders of magnitude. Small spans raised above / dropped below the line are mapped."""
@@ -211,6 +227,15 @@ def page_blocks(fitz, page) -> list[TB]:
             spans = [sp for sp in ln["spans"] if sp["text"]]
             if not spans:
                 continue
+            for k, sp in enumerate(spans):
+                if SYMFONT_RE.search(sp.get("font", "")) and re.search(r"[A-Za-z]", sp["text"]):
+                    new = sp["text"].translate(GREEK)
+                    if new != sp["text"] and fixes is not None:
+                        before = "".join(s["text"] for s in spans[max(0, k - 1):k])[-15:]
+                        after = "".join(s["text"] for s in spans[k + 1:k + 2])[:15]
+                        fixes.append({"page": page.number + 1, "from": sp["text"].strip(), "to": new.strip(),
+                                      "context": f"{before}{new}{after}".strip()})
+                    sp["text"] = new
             big = [sp for sp in spans if sp["size"] >= 0.9 * body] or spans
             base = sorted(sp["origin"][1] for sp in big)[len(big) // 2]
             txt = ""
@@ -302,6 +327,102 @@ def estimate_refs(raw_text: str) -> int | None:
     return best if best >= 8 else None
 
 
+REF_HEAD_STRIP_RE = re.compile(r"^\s*(?:\[\d{1,4}\]|\(\d{1,4}\)|\d{1,4}\.|\d{1,4})\s*")
+# like REF_MARK_RE, but a visual line may hold the number alone ("34." on its own line)
+REF_LINE_RE = re.compile(r"^[ \t]*(?:\[(\d{1,4})\]|\((\d{1,4})\)|(\d{1,4})\.(?=\s|$)|(\d{1,4})(?=[ \t]+[A-Z]|$))")
+REF_TAIL_STOP_RE = re.compile(r"^\s*(?:©|#|acknowledg|publisher|disclaimer|supplementary|appendix|data availability|"
+                              r"author contrib|conflicts? of interest|declaration|funding|this journal|downloaded|"
+                              r"received|\d{1,5}\s*$)", re.I)
+LONG_LINE = 1500  # file readers often cut lines at ~2000 characters
+
+
+def soft_wrap(p: str, limit: int = LONG_LINE) -> str:
+    """Break an over-long paragraph into lines <= limit at sentence ends (paragraphs stay blank-line separated)."""
+    if len(p) <= limit:
+        return p
+    sents = re.split(r"(?<=[.!?。！？;；])\s+(?=\S)", p)
+    out, cur = [], ""
+    for s in sents:
+        while len(s) > limit:  # one giant "sentence" (e.g. a run of references): cut at a space
+            cut = s.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            s1, s = s[:cut].rstrip(), s[cut:].lstrip()
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(s1)
+        if cur and len(cur) + 1 + len(s) > limit:
+            out.append(cur)
+            cur = s
+        else:
+            cur = f"{cur} {s}" if cur else s
+    if cur:
+        out.append(cur)
+    return "\n".join(out)
+
+
+def split_refs(lines: list) -> tuple[list[tuple[int, str]], list[int], list[int]]:
+    """Cut the numbered reference list into entries from visual lines [(page, text|None)].
+    None marks a block boundary. Returns (entries [(n, text)], missing numbers, pages used)."""
+    marks: dict[int, list[tuple[int, int]]] = {0: [], 1: [], 2: [], 3: []}
+    for i, (_, t) in enumerate(lines):
+        if t is None:
+            continue
+        m = REF_LINE_RE.match(t)
+        if m:
+            for style in range(4):
+                if m.group(style + 1):
+                    marks[style].append((i, int(m.group(style + 1))))
+    best: list[tuple[int, int]] = []
+    for seq in marks.values():
+        for s in [k for k, (_, n) in enumerate(seq) if n == 1][-6:]:
+            run, last = [seq[s]], 1
+            for i, n in seq[s + 1:]:
+                if n == last + 1 or n == last + 2:
+                    run.append((i, n))
+                    last = n
+            # ties go to the later start: section headings ("1. Introduction") and affiliations
+            # number 1, 2, 3 ... too and would otherwise swallow the first references
+            if len(run) >= len(best):
+                best = run
+    if len(best) < 8:
+        return [], [], []
+    entries = []
+    for k, (i, n) in enumerate(best):
+        end = best[k + 1][0] if k + 1 < len(best) else None
+        parts, j = [REF_HEAD_STRIP_RE.sub("", lines[i][1], count=1)], i + 1
+        while j < len(lines) and (end is None or j < end):
+            t = lines[j][1]
+            if t is not None:
+                if end is None:  # last entry: stop once it looks complete, or at back matter
+                    done = " ".join(parts)
+                    mk = REF_LINE_RE.match(t)
+                    new_entry = mk and int(next(g for g in mk.groups() if g)) < 1900  # "(2020) 115426" is a year
+                    if len(done) > 700 or REF_TAIL_STOP_RE.match(t) or new_entry or \
+                            (re.search(r"\b(19|20)\d{2}\b", done) and re.search(r"[.\d)]\s*$", done)):
+                        break
+                parts.append(t)
+            j += 1
+        entries.append((n, re.sub(r"\s+", " ", join_lines("\n".join(parts))).strip()))
+    nums = [n for n, _ in entries]
+    missing = [n for n in range(1, nums[-1] + 1) if n not in set(nums)]
+    pages = sorted({lines[i][0] for i, _ in best})
+    return entries, missing, pages
+
+
+def write_refs(path: str, entries, missing, pages, estimate) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        span = f"第 {pages[0]}–{pages[-1]} 页" if pages[0] != pages[-1] else f"第 {pages[0]} 页"
+        fh.write(f"<!-- pdftrans：从原文{span}切出 {len(entries)} 条（编号 1–{entries[-1][0]}）；"
+                 f"原文估计 {estimate or '?'} 条。末条结尾与缺号请对照 source.txt 核对 -->\n\n")
+        have = dict(entries)
+        for n in range(1, entries[-1][0] + 1):
+            if n in have:
+                fh.write(f"{n}. {have[n]}\n")
+            else:
+                fh.write(f"{n}. <!-- 缺第 {n} 条：提取时没切出来，请从 source.txt 补上 -->\n")
+
+
 def cmd_extract(a) -> int:
     fitz = need_fitz()
     pdf, out = os.path.abspath(a.pdf), os.path.abspath(a.outdir)
@@ -309,16 +430,21 @@ def cmd_extract(a) -> int:
         die(f"找不到 PDF：{pdf}")
     wd = work_dir(out)
     pages_txt, raw_all, counts, captions, scanned = [], [], [], [], []
+    ref_lines: list = []
+    sym_fixes: list = []
     seen: set = set()
     with fitz.open(pdf) as doc:
         if doc.needs_pass:
             die("PDF 已加密，需要密码", 3)
         meta = {k: v for k, v in (doc.metadata or {}).items() if v}
         for pno, page in enumerate(doc, 1):
-            ordered = reading_order(page_blocks(fitz, page), page.rect)
+            ordered = reading_order(page_blocks(fitz, page, sym_fixes), page.rect)
             captions += find_captions(pno, ordered, seen)
-            paras = [join_lines(b.text) for b in ordered]
+            paras = [soft_wrap(join_lines(b.text)) for b in ordered]
             pages_txt.append("\n\n".join(p for p in paras if p))
+            for b in ordered:  # running headers/footers out, but keep a reference entry that sits at the page top
+                if not in_margin(b.rect, page.rect) or (REF_LINE_RE.match(b.text) and len(b.text.strip()) > 12):
+                    ref_lines += [(pno, t.strip()) for t in b.text.splitlines() if t.strip()] + [(pno, None)]
             raw = page.get_text("text")
             raw_all.append(raw)
             c = len(re.sub(r"\s+", "", raw))
@@ -330,16 +456,35 @@ def cmd_extract(a) -> int:
         for i, t in enumerate(pages_txt, 1):
             fh.write(f"<<<PAGE {i}>>>\n{t}\n\n")
     refs = estimate_refs("\n".join(raw_all))
+    entries, missing, rpages = split_refs(ref_lines)
+    refs_path = os.path.join(wd, "refs.md")
+    if entries:
+        write_refs(refs_path, entries, missing, rpages, refs)
+    elif os.path.isfile(refs_path):
+        os.remove(refs_path)
     figs = sorted({(c["kind"], c["num"]) for c in captions if c["kind"] != "table" and not c["continued"]})
     tabs = sorted({c["num"] for c in captions if c["kind"] == "table" and not c["continued"]})
     old = load_manifest(out)
     manifest = {"tool": f"pdftrans {VERSION}", "pdf": pdf, "pages": npages, "metadata": meta,
                 "chars_per_page": counts, "scanned_pages": scanned, "references_estimate": refs,
+                "references_split": {"count": len(entries), "last": entries[-1][0] if entries else 0,
+                                     "missing": missing, "pages": rpages} if entries else None,
+                "symbol_fixes": {"count": len(sym_fixes), "samples": sym_fixes[:40]},
                 "captions": captions, "figures": old.get("figures", [])}
     save_manifest(out, manifest)
     print(f"pages={npages}  chars={sum(counts)}  figures={len(figs)}  tables={len(tabs)}  "
           f"references~{refs if refs else '?'}")
     print(f"-> {os.path.join(wd, 'source.txt')}")
+    if entries:
+        gap = f"，缺号 {missing[:10]}" if missing else ""
+        warn = "  <- 与估计不符，请核对" if refs and entries[-1][0] != refs else ""
+        print(f"-> {refs_path}  参考文献 {len(entries)} 条（1–{entries[-1][0]}{gap}）{warn}")
+    else:
+        print("参考文献：未切出编号列表（作者-年份制或版式特殊），请从 source.txt 整理")
+    if sym_fixes:
+        kinds = sorted({f"{f['from']}→{f['to']}" for f in sym_fixes})
+        print(f"符号字体还原 {len(sym_fixes)} 处：{'、'.join(kinds[:12])}{' …' if len(kinds) > 12 else ''}"
+              f"（样例见 manifest.json 的 symbol_fixes，可疑处用 pages 看原页）")
     if scanned:
         print(f"WARNING: 疑似扫描页（几乎无文字层）：{scanned[:20]}{' ...' if len(scanned) > 20 else ''}")
         if len(scanned) == npages:
@@ -800,7 +945,7 @@ LATIN_RUN_RE = re.compile(r"(?:[A-Za-z][A-Za-z'’\-]*[ ,;:]+){10,}[A-Za-z]")
 PLACEHOLDER_RE = re.compile(r"<!--\s*CONT\s*-->|\bTODO\b|\bFIXME\b|待译|待补|未完待续|\[\[TBD\]\]")
 SPECIAL_START = ("#", ">", "|", "```", "<", "![", "---", "$$")
 LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
-TERMINAL_RE = re.compile(r"[。！？…!?：:；;）)」』】》”\"*`_\]$|]$")  # no commas: a line ending in ，/,/、 is mid-sentence
+TERMINAL_RE = re.compile(r"[。！？…!?：:；;）)」』】》”\"*`_\]$|.]$")  # no commas: a line ending in ，/,/、 is mid-sentence
 # a caption line: bold label + number in any language, or a known unnumbered kind (graphical abstract, TOC)
 CAPSTART_RE = re.compile(r"^\s*\*\*\s*(?:图文摘要|graphical abstract|toc\b|table of contents)", re.IGNORECASE)
 RECOMMENDED = ("title", "title_orig", "venue", "year", "doi", "target_lang", "one_liner")
@@ -920,23 +1065,33 @@ def check_paper(folder: str, opts) -> tuple[str, list[tuple[str, str]], dict]:
     # page anchors
     man = load_manifest(folder)
     npages = man.get("pages")
-    legacy = os.path.join(folder, "原文提取.txt")
-    if not npages and os.path.isfile(legacy):
-        nums = re.findall(r"<<<PAGE\s+(\d+)>>>", open(legacy, encoding="utf-8", errors="replace").read())
-        npages = max(map(int, nums)) if nums else None
-    anchors = [int(n) for n in ANCHOR_RE.findall(body)]
+    if not npages:  # no manifest: fall back to the page markers of _work/source.txt or 原文提取.txt
+        sp = source_pages(folder)
+        npages = max(p for p, _ in sp) if sp else None
+    blocks = md_blocks(lines)
+    ranch = real_anchors(lines, blocks)  # anchors inside code blocks are examples, not anchors
+    anchors = [p for _, p, _ in ranch]
     if npages:
         if not anchors:
-            msgs.append(("WARN", f"没有页码锚点 <!-- pN -->（原文 {npages} 页）"))
+            msgs.append(("WARN", f"没有页码锚点 <!-- pN -->（原文 {npages} 页）→ 运行 anchor 自动插入"))
         else:
             if anchors != sorted(anchors) or len(set(anchors)) != len(anchors):
-                msgs.append(("WARN", "页码锚点不是严格递增"))
+                dup = sorted({p for p in anchors if anchors.count(p) > 1})
+                msgs.append(("WARN", "页码锚点不是严格递增" + (f"（重复：{', '.join(map(str, dup))}）" if dup else "")
+                             + " → 运行 anchor 重排"))
             missing = [p for p in range(1, npages + 1) if p not in set(anchors)]
             if max(anchors) > npages:
                 msgs.append(("WARN", f"页码锚点超出原文页数（最大 {max(anchors)} / 原文 {npages}）"))
             if missing:
                 msgs.append(("WARN", f"这些页没有锚点（可能漏译）：{', '.join(map(str, missing[:15]))}"
                                      f"{' ...' if len(missing) > 15 else ''}"))
+    inline = [x + L0 for x, _, st in ranch if not st]
+    if inline:
+        msgs.append(("WARN", f"页码锚点要单独成行，这些行里嵌着锚点：{', '.join(map(str, inline[:6]))} → 运行 anchor"))
+    stray = [s + L0 for s, e, k in blocks if k == "html" or (k not in ("code", "anchor") and
+                                                            re.search(r"<!--(?!\s*p\s*\d+\s*-->)", " ".join(lines[s:e])))]
+    if stray:
+        msgs.append(("WARN", f"除页码锚点外不应有 HTML 注释或标签（如 refs.md 开头的说明行、缺号注释）：行 {', '.join(map(str, stray[:6]))}"))
 
     # images
     refs = IMG_RE.findall(body)
@@ -1068,6 +1223,10 @@ def check_paper(folder: str, opts) -> tuple[str, list[tuple[str, str]], dict]:
             msgs.append(("WARN", f"疑似未译的外文整句 {len(hits)} 处（行 {', '.join(map(str, hits[:6]))}）"))
         if cjk + latin > 500 and cjk < 0.4 * latin:
             msgs.append(("WARN", f"目标语言文字比例偏低（CJK {cjk} / 拉丁字母 {latin}），可能大段未译"))
+    if not getattr(opts, "structure_only", False):
+        doc = {"fields": fields or {}, "has_yaml": fields is not None, "lines": lines, "body": body, "off": off,
+               "text": text, "name": md, "path": os.path.join(folder, md)}
+        msgs += v3_checks(folder, doc, lines, L0, ref_i, anchors)
     return md, msgs, info
 
 
@@ -1088,7 +1247,7 @@ def cmd_check(a) -> int:
     if not os.path.isdir(a.path):
         die(f"不是文件夹：{a.path}")
     tot = {"papers": 0, "fail": 0, "warn": 0, "bad": 0}
-    lines = []
+    lines, jpapers = [], []
     for name, folder in iter_papers(a.path):
         tot["papers"] += 1
         md, msgs, info = check_paper(folder, a)
@@ -1098,12 +1257,27 @@ def cmd_check(a) -> int:
         tot["warn"] += len(w)
         tot["bad"] += bool(f)
         st = "FAIL" if f else ("WARN" if w else "OK")
+        if getattr(a, "json", False):
+            def item(m):
+                head, *rest = m.split(DETAIL_INDENT)
+                return {"message": head, "details": rest}
+            jpapers.append({"paper": name, "file": md, "status": st, **info,
+                            "fail": [item(m) for m in f], "warn": [item(m) for m in w]})
+            continue
         if a.quiet and st == "OK":
             continue
         lines.append(f"[{st}] {name}  {md}  图注 {info['figs']} · 表注 {info['tabs']} · 参考文献 {info['refs']}")
         lines += [f"    FAIL  {m}" for m in f] + [f"    WARN  {m}" for m in w]
     if not tot["papers"]:
         die("没找到文献文件夹（含 *.<lang>.md 译稿或 _work/ 的子文件夹）", 1)
+    if getattr(a, "json", False):
+        passed = tot["fail"] == 0 and (not a.strict or tot["warn"] == 0)
+        report = json.dumps({"papers": jpapers, "total": tot, "passed": passed}, ensure_ascii=False, indent=1)
+        if a.log:
+            with open(a.log, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(report + "\n")
+        print(report)
+        return 0 if passed else 1
     summary = f"共 {tot['papers']} 篇 · FAIL {tot['fail']} 条（{tot['bad']} 篇）· WARN {tot['warn']} 条"
     passed = tot["fail"] == 0 and (not a.strict or tot["warn"] == 0)
     report = "\n".join(lines) + f"\n\n{summary}\n结果：{'通过' if passed else '未通过'}"
@@ -1175,7 +1349,11 @@ def brief_paper(folder: str, a) -> str:
     for lab, val in (("原文", meta.get("title_orig")), ("出处", src), ("DOI", meta.get("doi"))):
         if val:
             out.append(f"{lab}：{val}")
-    for k in ("one_liner", "subject", "method", "key_result"):
+    for k in ("keywords", "one_liner", "subject", "method", "key_result"):
+        if meta.get(k):
+            out.append(f"{k}：{meta[k]}")
+    ff = find_fields_file(folder)
+    for k, _ in (parse_fields_file(ff) if ff else []):
         if meta.get(k):
             out.append(f"{k}：{meta[k]}")
 
@@ -1202,6 +1380,8 @@ def brief_paper(folder: str, a) -> str:
         n = sum(len(x) for x in lines[s + 1:e])
         size = f"{n / 1000:.1f}k" if n >= 1000 else str(n)
         out.append(f"L{L(s)}-{L(e - 1)}  {P(i):>4}  {'  ' * (lv - 2)}{t}  [{size}]")
+    if getattr(a, "toc_only", False):
+        return "\n".join(out)
 
     # abstract
     ab = next((k for k, (i, lv, t) in enumerate(heads) if ABS_HEAD_RE.match(_strip_num(t))), None)
@@ -1255,7 +1435,7 @@ def cmd_brief(a) -> int:
 
 # ----------------------------------------------------------------------------- cards
 CARD_ORDER =["folder", "title", "title_orig", "authors", "venue", "year", "doi", "type", "field",
-              "source_lang", "target_lang", "pages", "figures", "tables", "references",
+              "source_lang", "target_lang", "pages", "figures", "tables", "references", "keywords",
               "one_liner", "subject", "method", "key_result"]
 HDR_LINE_RE = re.compile(r"^\*\*([^*]{1,16})\*\*\s*[：:]\s*(.+)$")
 HDR_KEYS = {"title_orig": ("原文标题", "original title", "title"),
@@ -1313,7 +1493,8 @@ def cmd_cards(a) -> int:
                 card[k] = v
         if not fields:
             card["source"] = "header-block"  # no YAML: one_liner / subject / method / key_result absent
-        _, _, info = check_paper(folder, argparse.Namespace(lang="zh", max_px=MAX_PX, max_side=MAX_SIDE))
+        _, _, info = check_paper(folder, argparse.Namespace(lang="zh", max_px=MAX_PX, max_side=MAX_SIDE,
+                                                            structure_only=True))
         for k, src in (("figures", "figs"), ("tables", "tabs"), ("references", "refs")):
             if not str(card.get(k, "")).strip() and info[src]:
                 card[k] = info[src]
@@ -1324,6 +1505,15 @@ def cmd_cards(a) -> int:
         cards.append(card)
     if not cards:
         die("没有找到任何译稿；路径应指向工作区根目录", 1)
+    if a.list:  # compact table on stdout, nothing written: the cheap first layer for reading a library
+        extra = [f.strip() for f in (a.with_ or "").split(",") if f.strip()]
+        clip = lambda s: re.sub(r"\s+", " ", str(s)).strip()  # noqa: E731
+        for c in cards:
+            row = [c["folder"], str(c.get("year", "—")), clip(c.get("type", "—")), clip(c.get("one_liner", "—"))]
+            row += [f"{f}: {clip(c.get(f, '—'))}" for f in extra]
+            print(" | ".join(row))
+        print(f"\n{len(cards)} 篇" + (f"；字段 {', '.join(extra)} 缺失的写作「—」" if extra else ""))
+        return 0
     out = a.out or os.path.join(root, "cards.jsonl")
     with open(out, "w", encoding="utf-8", newline="\n") as fh:
         for c in cards:
@@ -1340,6 +1530,1843 @@ def cmd_cards(a) -> int:
                 fh.write(f"| {i} | [{esc(c['title'])}](<{c['file']}>) | {esc(c.get('venue', ''))} | {esc(c.get('year', ''))} | "
                          f"{esc(c.get('figures', ''))} | {esc(c.get('references', ''))} | {esc(c.get('one_liner', ''))} |\n")
         print(f"表格 -> {p}")
+    return 0
+
+
+# ----------------------------------------------------------------------------- v3: source text + page evidence
+SRC_PAGE_RE = re.compile(r"<<<PAGE\s+(\d+)>>>")
+NUM_TOKEN_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?!\.?\d)")
+LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z\-]{2,}")
+FIGREF_RE = re.compile(r"(图|圖|図|表|Fig(?:ure)?s?\.?|Tables?|Tab\.?|Abb\.?|Abbildung)\s*(S?\d{1,3})", re.I)
+SIG_STOP = {"the", "and", "for", "with", "were", "was", "from", "that", "this", "are", "which", "fig", "figure",
+            "figures", "table", "tables", "than", "into", "have", "has", "been", "after", "each", "all", "not",
+            "also", "these", "those", "their", "its", "our", "both", "using", "used", "use", "between", "within"}
+SUBSCRIPT_DIGITS = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+SUPERSCRIPT_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+ENTRY_SPLIT_RE = re.compile(f"(?=[{CIRCLED}])")
+
+
+def norm_digits(t: str) -> str:
+    """Subscript digits to ASCII (OD₆₀₀ = OD600) and thousands separators out (1,000 = 1000).
+    Superscripts are kept on purpose: 10⁶ must not match a translation that lost it as 106."""
+    t = t.translate(SUBSCRIPT_DIGITS)
+    return re.sub(r"(?<=\d)[,  ](?=\d{3}(?!\d))", "", t)
+
+
+def sig_tokens(text: str) -> set:
+    """Tokens that survive translation: numbers, Latin words (names, genes, abbreviations), figure/table numbers."""
+    t = norm_digits(text)
+    out = {n for n in NUM_TOKEN_RE.findall(t) if len(n) >= 2}
+    out |= {w.lower() for w in LATIN_TOKEN_RE.findall(t) if w.lower() not in SIG_STOP}
+    for m in FIGREF_RE.finditer(t):
+        out.add(("T" if m.group(1)[0] in "表Tt" else "F") + m.group(2).upper())
+    return out
+
+
+def source_path(folder: str) -> str | None:
+    for p in (os.path.join(folder, WORK, "source.txt"), os.path.join(folder, "原文提取.txt")):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def source_pages(folder: str) -> list:
+    """[(page_number, text)] from _work/source.txt (or the legacy 原文提取.txt); [] when absent."""
+    p = source_path(folder)
+    if not p:
+        return []
+    txt = open(p, encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
+    parts = SRC_PAGE_RE.split(txt)
+    return [(int(parts[k]), parts[k + 1]) for k in range(1, len(parts) - 1, 2)]
+
+
+RUN_MAX = 200  # running headers / footers are short
+
+
+def _run_key(par: str) -> str:
+    return re.sub(r"[\s|]+", " ", re.sub(r"\d+", "#", par.lower())).strip()
+
+
+def running_keys(paras) -> set:
+    """Running headers and footers of a source, from (page, paragraph) pairs: short paragraphs (journal line,
+    URL, 'Page 3 of 9', 'Wang et al.') that recur on at least 3 pages and on 30% of all pages once digits are
+    masked (the page number inside them changes). Measured on a 38-paper library: every paper's running lines
+    found, no body paragraph caught; first-page mastheads (not repeated) and reference entries stay.
+    source.txt keeps these lines (they carry volume, article number and DOI); find and pair skip them."""
+    seen, pages = defaultdict(set), set()
+    for p, t in paras:
+        pages.add(p)
+        t = t.strip()
+        if t and len(t) <= RUN_MAX and re.search(r"[A-Za-z]{3}", t):
+            k = _run_key(t)
+            if len(k) >= 8 or "#" in k:
+                seen[k].add(p)
+    n = len(pages)
+
+    def typical(k):  # page numbers, volume/year, URLs, 'Wang et al.': what running lines are made of
+        return "#" in k or "www" in k or "http" in k or "et al" in k
+    return {k for k, ps in seen.items() if len(ps) >= max(3, (0.3 if typical(k) else 0.5) * n)}
+
+
+def is_running(par: str, keys: set) -> bool:
+    t = par.strip()
+    return bool(keys) and len(t) <= RUN_MAX and _run_key(t) in keys
+
+
+def page_paras(pages: list):
+    """(page, paragraph) pairs of source pages (paragraphs are separated by a blank line)."""
+    return [(p, x) for p, t in pages for x in re.split(r"\n\s*\n", t) if x.strip()]
+
+
+def strip_running(pages: list) -> tuple:
+    """Source pages without their running headers/footers, and how many paragraphs were left out."""
+    keys = running_keys(page_paras(pages))
+    out, n = [], 0
+    for p, t in pages:
+        keep = []
+        for x in re.split(r"\n\s*\n", t):
+            if x.strip() and is_running(x, keys):
+                n += 1
+            elif x.strip():
+                keep.append(x.strip("\n"))
+        out.append((p, "\n\n".join(keep)))
+    return out, n
+
+
+FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+ITEM_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d{1,4}[.)])\s+\S")
+RULE_RE = re.compile(r"(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,}")
+
+
+def load_translation(folder: str) -> dict | None:
+    """Read the translation strictly. A file that is not UTF-8 is reported ('fatal') and never rewritten."""
+    mds = translation_file(folder)
+    if not mds:
+        return None
+    path = os.path.join(folder, mds[0])
+    raw = open(path, "rb").read()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    if bom:
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return {"path": path, "name": mds[0], "text": "", "fields": {}, "has_yaml": False, "body": "", "off": 1,
+                "lines": [], "errs": [], "normalized": [],
+                "fatal": f"不是 UTF-8 编码（第 {exc.start} 字节起无法解码）：先转成 UTF-8；脚本不会改写这个文件"}
+    crlf = "\r" in text
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    fields, body, off, errs = parse_front_matter(text)
+    return {"path": path, "name": mds[0], "text": text, "fields": fields or {}, "has_yaml": fields is not None,
+            "body": body, "off": off, "lines": body.split("\n"), "errs": errs, "fatal": None,
+            "normalized": [x for x, f in (("去掉 BOM", bom), ("CRLF 换行改为 LF", crlf)) if f]}
+
+
+def md_blocks(lines: list, start: int = 0, stop: int | None = None) -> list:
+    """Logical Markdown blocks as (first, end_exclusive, kind). kind is one of blank, code, anchor, heading,
+    image, table, quote, html, item (a list item with its continuation lines) or para (soft-wrapped lines of
+    one paragraph). Page anchors are only ever inserted between blocks, never inside one."""
+    stop = len(lines) if stop is None else stop
+
+    def starts_block(s):  # lines that open a new block even without a blank line before them
+        st = s.strip()
+        return (not st or FENCE_RE.match(s) or ANCHOR_RE.fullmatch(st) or HEAD_RE.match(s) or RULE_RE.fullmatch(st)
+                or st.startswith(("|", ">", "![")) or ITEM_RE.match(s))
+
+    out, i = [], start
+    while i < stop:
+        ln = lines[i]
+        s = ln.strip()
+        j = i + 1
+        fm = FENCE_RE.match(ln)
+        if not s:
+            kind = "blank"
+        elif fm:
+            fence = fm.group(1)
+            close = re.compile(re.escape(fence[0]) + "{%d,}\\s*" % len(fence))
+            while j < stop and not close.fullmatch(lines[j].strip()):
+                j += 1
+            j, kind = min(j + 1, stop), "code"
+        elif ANCHOR_RE.fullmatch(s):
+            kind = "anchor"
+        elif RULE_RE.fullmatch(s):
+            kind = "rule"
+        elif HEAD_RE.match(ln):
+            kind = "heading"
+        elif s.startswith("|"):
+            while j < stop and lines[j].strip().startswith("|"):
+                j += 1
+            kind = "table"
+        elif s.startswith(">"):
+            while j < stop and lines[j].strip() and not (FENCE_RE.match(lines[j]) or HEAD_RE.match(lines[j])
+                                                          or ANCHOR_RE.fullmatch(lines[j].strip())):
+                j += 1
+            kind = "quote"
+        elif s.startswith("<") and not ANCHOR_RE.match(s):
+            while j < stop and lines[j].strip():
+                j += 1
+            kind = "html"
+        elif s.startswith("!["):
+            kind = "image"
+        else:
+            kind = "item" if ITEM_RE.match(ln) else "para"
+            while j < stop and not starts_block(lines[j]):
+                j += 1
+        out.append((i, j, kind))
+        i = j
+    return out
+
+
+def real_anchors(lines: list, blocks: list | None = None) -> list:
+    """[(line, page, standalone)] for every page anchor outside code blocks, in file order."""
+    out = []
+    for s, e, k in (blocks if blocks is not None else md_blocks(lines)):
+        if k == "code":
+            continue
+        for x in range(s, e):
+            for m in ANCHOR_RE.finditer(lines[x]):
+                out.append((x, int(m.group(1)), k == "anchor"))
+    return out
+
+
+def align_units(lines: list, blocks: list | None = None) -> list:
+    """[(first_line, text)] of the blocks that carry page evidence: paragraphs (all their soft-wrapped lines),
+    list items (reference entries) and block quotes. The header block (before the first anchor or ## heading),
+    headings, figures, captions, tables and code are left out: floats follow the section that cites them."""
+    blocks = blocks if blocks is not None else md_blocks(lines)
+    cands = [x for x, _, _ in real_anchors(lines, blocks)]
+    cands += [s for s, e, k in blocks if k == "heading" and not lines[s].lstrip().startswith("# ")]
+    if cands:
+        start = min(cands)
+    else:
+        start = next((s + 1 for s, e, k in blocks if k == "heading"), 0)
+    units = []
+    for s, e, k in blocks:
+        if s < start or k not in ("para", "item", "quote"):
+            continue
+        txt = " ".join(ANCHOR_RE.sub("", lines[x]).strip() for x in range(s, e)).strip()
+        if not txt or ((CAPLINE_RE.match(txt) or CAPSTART_RE.match(txt)) and not META_LINE_RE.match(txt)):
+            continue
+        units.append((s, txt))
+    return units
+
+
+def line_pages(lines: list, blocks: list | None = None) -> list:
+    """Page of every body line according to the anchors in the file (None before the first)."""
+    at = {}
+    for x, p, _ in real_anchors(lines, blocks):
+        at[x] = p
+    page, out = None, []
+    for i in range(len(lines)):
+        page = at.get(i, page)
+        out.append(page)
+    return out
+
+
+def page_evidence(unit_tokens: list, pages: list):
+    ptok = [sig_tokens(t) for _, t in pages]
+    P = len(pages)
+    df = Counter()
+    for s in ptok:
+        df.update(s)
+    idf = {k: math.log((P + 1) / (v + 0.5)) for k, v in df.items()}
+    S = [[sum(idf.get(t, 0.0) for t in ut if t in ptok[p]) for p in range(P)] for ut in unit_tokens]
+    return S, ptok, idf
+
+
+def auto_assign(S: list, jump: float = 0.3) -> list:
+    """Monotone page assignment maximising evidence minus jump × pages skipped (no anchors to start from).
+    new[p] = S[i][p] + max_{q<=p}(dp[q] - jump*(p-q)) = S[i][p] + max_{q<=p}(dp[q] + jump*q) - jump*p."""
+    n, P = len(S), len(S[0])
+    dp = [S[0][p] - jump * p for p in range(P)]
+    back = []
+    for i in range(1, n):
+        new, bk = [0.0] * P, [0] * P
+        best, bq = float("-inf"), 0
+        for p in range(P):
+            if dp[p] + jump * p > best:
+                best, bq = dp[p] + jump * p, p
+            new[p], bk[p] = best - jump * p + S[i][p], bq
+        dp = new
+        back.append(bk)
+    p = max(range(P), key=lambda q: dp[q])
+    out = [0] * n
+    out[-1] = p
+    for i in range(n - 1, 0, -1):
+        p = back[i - 1][p]
+        out[i - 1] = p
+    return out
+
+
+def hybrid_assign(S: list, Sh: list, ptok: list, idf: dict, unit_tokens: list, model: list):
+    """Keep the translator's pages; move a paragraph to the neighbouring page only when (1) that page holds
+    several of its tokens the translator's page lacks, (2) the overall evidence clearly favours it, and (3) the
+    opening of the paragraph (Sh) also points there: a paragraph that starts on page m and runs onto m+1 belongs
+    to m even when most of its numbers are on m+1. Then restore monotone order with the fewest changes."""
+    n, P = len(S), len(S[0])
+    strong = {}
+    for i in range(n):
+        m = model[i]
+        if m is None:
+            continue
+        b = max(range(P), key=lambda q: S[i][q])
+        if b == m or abs(b - m) != 1:
+            continue
+        spec = [t for t in unit_tokens[i] if t in ptok[b] and t not in ptok[m]]
+        # precise numbers (decimals, 3+ digits) are the hardest evidence: all on b, none on m settles it even
+        # when shared words (a caption on page m using the same terms) blur the overall score
+        nums = {t for t in unit_tokens[i] if re.fullmatch(r"\d+\.\d+|\d{3,}", t)}
+        by_numbers = len(nums & ptok[b]) >= 2 and not (nums & ptok[m])
+        if (S[i][b] - S[i][m] >= 4.0 and len(spec) >= 2 and (S[i][m] <= 0.25 * S[i][b] or by_numbers)
+                and Sh[i][b] > Sh[i][m]):
+            strong[i] = (b, sorted(spec, key=lambda t: -idf.get(t, 0.0))[:6])
+
+    def cost(i, p):
+        if i in strong:
+            return 0.0 if p == strong[i][0] else 5.0
+        if model[i] is None:
+            return 0.0
+        return 0.0 if p == model[i] else 1.0 + 0.001 * abs(p - model[i])
+
+    INF = float("inf")
+    dp = [cost(0, p) for p in range(P)]
+    back = []
+    for i in range(1, n):
+        new, bk = [INF] * P, [0] * P
+        best, bq = INF, 0
+        for p in range(P):
+            if dp[p] < best:
+                best, bq = dp[p], p
+            new[p], bk[p] = best + cost(i, p), bq
+        dp = new
+        back.append(bk)
+    p = min(range(P), key=lambda q: dp[q])
+    out = [0] * n
+    out[-1] = p
+    for i in range(n - 1, 0, -1):
+        p = back[i - 1][p]
+        out[i - 1] = p
+    return out, strong
+
+
+def head_text(t: str) -> str:
+    """Opening of a paragraph: decides the page it starts on."""
+    return t[:max(150, len(t) // 3)]
+
+
+def plan_anchors(doc: dict, pages: list, force_auto: bool = False) -> dict:
+    """Decide the page of every text paragraph. Mode 'check' when the file has anchors (translator's pages,
+    corrected on strong evidence), 'auto' when it has none (or force_auto)."""
+    lines = doc["lines"]
+    blocks = md_blocks(lines)
+    ul = align_units(lines, blocks)
+    units, texts = [s for s, _ in ul], [t for _, t in ul]
+    pnos = [p for p, _ in pages]
+    idx = {p: k for k, p in enumerate(pnos)}
+    lp = line_pages(lines, blocks)
+    has_anchors = any(x is not None for x in lp)
+    res = {"units": units, "texts": texts, "blocks": blocks, "pnos": pnos, "old": [lp[i] for i in units],
+           "has_anchors": has_anchors, "mode": "auto" if (force_auto or not has_anchors) else "check",
+           "strong": {}, "no_evidence": 0, "empty_pages": []}
+    if not units or not pages:
+        res["new"] = res["old"]
+        return res
+    utok = [sig_tokens(t) for t in texts]
+    htok = [sig_tokens(head_text(t)) for t in texts]
+    S, ptok, idf = page_evidence(utok, pages)
+    P = len(pages)
+    Sh = [[sum(idf.get(t, 0.0) for t in ht if t in ptok[p]) for p in range(P)] for ht in htok]
+    res["no_evidence"] = sum(1 for row in S if max(row) <= 0)
+    if res["mode"] == "auto":
+        # mild position prior: a paragraph a third into the translation sits about a third into the source
+        # prose. Stops evidence-free openings (abstracts) from sliding onto page 2; tested beta 0-40, 8 is safe.
+        # The opening of each paragraph counts twice (a paragraph belongs to the page it starts on).
+        tl = [len(t) for t in texts]
+        tot, cum, ft = sum(tl) or 1, 0, []
+        for x in tl:
+            ft.append((cum + x / 2) / tot)
+            cum += x
+        pc = [prose_chars(t) for _, t in pages]
+        ptot, c, fs = sum(pc) or 1, 0, []
+        for x in pc:
+            fs.append((c + x / 2) / ptot)
+            c += x
+        assign = auto_assign([[S[i][p] + Sh[i][p] - 8.0 * abs(ft[i] - fs[p]) for p in range(P)]
+                              for i in range(len(units))])
+    else:
+        def to_idx(p):
+            if p is None:
+                return None
+            if p in idx:
+                return idx[p]
+            return min(range(len(pnos)), key=lambda k: abs(pnos[k] - p))
+        assign, strong = hybrid_assign(S, Sh, ptok, idf, utok, [to_idx(p) for p in res["old"]])
+        res["strong"] = {units[i]: (pnos[b], toks) for i, (b, toks) in strong.items()}
+    res["new"] = [pnos[k] for k in assign]
+    covered = set(res["new"])
+    res["empty_pages"] = [p for p in pnos if p not in covered]
+    return res
+
+
+def place_anchors(lines: list, units: list, final: list, pnos: list, blocks: list | None = None) -> list:
+    """Rewrite the body with one standalone <!-- pN --> per source page, inserted only between blocks (never
+    inside a paragraph, table, list item, quote or code block; anchors inside code are left alone). An existing
+    anchor stays where it is when it already sits in the right gap; otherwise the anchor goes before the
+    headings that open the page's first paragraph. Pages with no text paragraph keep their anchor or stack
+    before the next page's."""
+    blocks = blocks if blocks is not None else md_blocks(lines)
+    N = len(lines)
+    kind, bstart, bend = [None] * N, list(range(N)), {}
+    for s, e, k in blocks:
+        bend[s] = e
+        for x in range(s, e):
+            kind[x], bstart[x] = k, s
+
+    def prev_content(i):
+        j = i - 1
+        while j >= 0 and kind[j] == "anchor":
+            j -= 1
+        return j
+
+    # pairs that become one block once old anchors are removed (paragraph split by an anchor line, table rows,
+    # an image and its caption): an anchor must not go between them
+    bad_pairs = {("table", "table"), ("para", "para"), ("quote", "quote"), ("image", "para"), ("item", "para")}
+
+    def legal(i):
+        while i < N and kind[i] == "anchor":  # old anchors disappear: judge the real neighbours
+            i += 1
+        if i <= 0 or i >= N:
+            return True
+        j = prev_content(i)
+        if j < 0 or not lines[j].strip() or not lines[i].strip():
+            return True
+        return (kind[j], kind[i]) not in bad_pairs
+
+    def snap(i):
+        i = bstart[i] if i < N else i
+        while not legal(i):
+            i = bstart[prev_content(i)]
+        return i
+
+    model_pos = {}
+    for x, p, _ in real_anchors(lines, blocks):
+        model_pos.setdefault(p, snap(bstart[x]))
+    first_line = {}
+    for li, pg in zip(units, final):
+        first_line.setdefault(pg, li)
+
+    def last_unit_before(p):
+        c = [li for li, pg in zip(units, final) if pg < p]
+        return c[-1] if c else -1
+
+    def default_pos(hi, lo):
+        j, k = hi, hi - 1
+        while k > lo:
+            if kind[k] in ("blank", "anchor"):
+                k -= 1
+                continue
+            if kind[k] == "heading" and not lines[k].lstrip().startswith("# "):
+                j = k
+                k -= 1
+                continue
+            break
+        return j
+
+    pos = {}
+    for p in pnos:
+        if p in first_line:
+            lo, hi = last_unit_before(p), first_line[p]
+            mp = model_pos.get(p)
+            pos[p] = mp if mp is not None and lo < mp <= hi else default_pos(hi, lo)
+    for p in pnos:  # pages without a paragraph starting on them (continuation, full-page figure/table, blank)
+        if p in pos:
+            continue
+        prev = max((pos[q] for q in pos if q < p), default=-1)
+        nxt = min((pos[q] for q in pos if q > p), default=None)
+        mp = model_pos.get(p)
+        if mp is not None and prev <= mp <= (nxt if nxt is not None else N):
+            pos[p] = mp
+        elif nxt is not None:
+            pos[p] = nxt
+        else:
+            pos[p] = bend.get(units[-1], N) if units else N
+    last = -1
+    for p in pnos:  # legal, and monotone with page order
+        pos[p] = max(snap(pos[p]), last)
+        last = pos[p]
+    at = defaultdict(list)
+    for p, li in pos.items():
+        at[li].append(p)
+    out = []
+    for i in range(N + 1):
+        for p in sorted(at.get(i, [])):
+            if out and out[-1].strip():
+                out.append("")
+            out += [f"<!-- p{p} -->", ""]
+        if i == N:
+            break
+        ln, k = lines[i], kind[i]
+        if k == "anchor":
+            continue
+        if k != "code" and ANCHOR_RE.search(ln):
+            ln = ANCHOR_RE.sub("", ln).rstrip()
+            if not ln.strip():
+                continue
+        if k == "blank" and out and not out[-1].strip():
+            continue
+        out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    return out + [""]
+
+
+def set_yaml_field(text: str, key: str, value: str) -> str:
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---\n", 3)
+    if end < 0:
+        return text
+    head, rest = text[:end], text[end:]
+    line = f'{key}: "{value}"'
+    if re.search(rf"(?m)^{re.escape(key)}:", head):
+        head = re.sub(rf"(?m)^{re.escape(key)}:.*$", line, head)
+    else:
+        head += "\n" + line
+    return head + rest
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Write to a temporary file in the same folder, then replace: an interrupted run never leaves half a file."""
+    tmp = path + ".pdftrans-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def anchor_layout_problems(lines: list, blocks: list, pnos: list) -> list:
+    """Structural problems of the anchors already in the file, against the source page list."""
+    ra = real_anchors(lines, blocks)
+    got = [p for _, p, _ in ra]
+    probs = []
+    dup = sorted({p for p in got if got.count(p) > 1})
+    if dup:
+        probs.append("重复 " + ", ".join(f"p{p}" for p in dup))
+    extra = sorted({p for p in got if p not in set(pnos)})
+    if extra:
+        probs.append("超出原文页码 " + ", ".join(f"p{p}" for p in extra))
+    if got != sorted(got):
+        probs.append("顺序不递增")
+    miss = [p for p in pnos if p not in set(got)]
+    if miss:
+        probs.append("缺 " + ", ".join(f"p{p}" for p in miss[:10]) + (" …" if len(miss) > 10 else ""))
+    inline = [x for x, _, st in ra if not st]
+    if inline:
+        probs.append(f"{len(inline)} 个没有单独成行")
+    return probs
+
+
+def cmd_anchor(a) -> int:
+    if not os.path.isdir(a.path):
+        die(f"不是文件夹：{a.path}")
+    n = changed = refused = 0
+    verb = "将" if a.dry_run else "已"
+    for name, folder in iter_papers(a.path):
+        doc = load_translation(folder)
+        if not doc:
+            continue
+        n += 1
+        if doc["fatal"]:
+            print(f"[拒绝] {name}  {doc['fatal']}")
+            refused += 1
+            continue
+        if doc["errs"]:
+            print(f"[拒绝] {name}  YAML 头有问题（{doc['errs'][0]}）：先修好再运行 anchor，以免改坏文件")
+            refused += 1
+            continue
+        sp = source_path(folder)
+        pages = source_pages(folder)
+        if not sp:
+            print(f"[跳过] {name}  没有 _work/source.txt：先用原 PDF 运行 extract")
+            continue
+        if not pages:
+            print(f"[跳过] {name}  {os.path.relpath(sp, folder)} 没有 <<<PAGE n>>> 分页标记，无法核对页码")
+            continue
+        r = plan_anchors(doc, pages, a.auto)
+        lines, units, blocks = doc["lines"], r["units"], r["blocks"]
+        if not units:
+            print(f"[跳过] {name}  没有可对齐的正文段落")
+            continue
+        texts = dict(zip(units, r["texts"]))
+        moved = [(units[k], o, w) for k, (o, w) in enumerate(zip(r["old"], r["new"])) if o != w]
+        probs = anchor_layout_problems(lines, blocks, r["pnos"])
+        want = "auto" if r["mode"] == "auto" else "checked"
+        meta_ok = not doc["has_yaml"] or str(doc["fields"].get("anchors", "")).strip() == want
+        off = doc["off"]
+        rewrite = True
+        if r["mode"] == "auto":
+            head = (f"[自动] {name}  {'原稿无锚点，' if not r['has_anchors'] else '按 --auto 重排，'}{verb}插入 {len(r['pnos'])} 个锚点；"
+                    f"{r['no_evidence']} 段没有数字/外文可比对，页码按上下文推定（误差可能 ±1 页）")
+        elif not moved and not probs:
+            rewrite = False
+            if meta_ok and not doc["normalized"]:
+                print(f"[OK]   {name}  锚点与原文一致")
+                continue
+            head = f"[OK]   {name}  锚点与原文一致" + ("" if meta_ok else f"；{verb}写入 anchors: \"checked\"")
+        elif not moved:
+            head = f"[整理] {name}  段落页码无误，但锚点{'；'.join(probs)}：{verb}重排为每页一个"
+        else:
+            head = f"[校正] {name}  {len(moved)} 段页码与原文证据不符，{verb}调整" + (f"；另：锚点{'；'.join(probs)}" if probs else "")
+        print(head)
+        if doc["normalized"]:
+            print(f"    编码规范化：{'、'.join(doc['normalized'])}")
+        shown = 0
+        for li, o, w in moved:
+            if r["mode"] == "auto" or shown >= a.show:
+                break
+            ev = r["strong"].get(li)
+            why = f"  依据：{', '.join(ev[1])}" if ev else "  （随相邻段落调整）"
+            print(f"    L{li + off} p{o}→p{w}{why}  {texts[li][:30]}")
+            shown += 1
+        if r["mode"] != "auto" and len(moved) > shown:
+            print(f"    …另有 {len(moved) - shown} 段")
+        if r["empty_pages"]:
+            print(f"    没有段落从这些页开始（续段页、纯图/表页，或漏译，请核对）：{', '.join('p%d' % p for p in r['empty_pages'][:20])}")
+        if r["mode"] == "check" and r["has_anchors"]:
+            n_model = len({p for p in r["old"] if p})
+            if n_model < 0.5 * len(r["pnos"]):
+                print(f"    提示：原稿锚点只覆盖 {n_model}/{len(r['pnos'])} 页，可考虑 --auto 整篇重排")
+        if a.dry_run:
+            continue
+        bdir = os.path.join(work_dir(folder), "backup")
+        os.makedirs(bdir, exist_ok=True)
+        bak = os.path.join(bdir, re.sub(r"\.md$", "", doc["name"]) + ".before-anchor.md")
+        if not os.path.exists(bak):
+            shutil.copyfile(doc["path"], bak)
+        prefix = doc["text"][:len(doc["text"]) - len(doc["body"])]
+        body = "\n".join(place_anchors(lines, units, r["new"], r["pnos"], blocks)) if rewrite else doc["body"]
+        write_atomic(doc["path"], set_yaml_field(prefix + body, "anchors", want))
+        changed += 1
+    if not n:
+        die("没找到译稿", 1)
+    tail = "预览，未改动文件" if a.dry_run else f"改动 {changed} 篇（首次改动前的原稿在 _work/backup/）"
+    print(f"\n共 {n} 篇，{tail}" + (f"；拒绝处理 {refused} 篇" if refused else ""))
+    return 1 if refused else 0
+
+
+# ----------------------------------------------------------------------------- v3: checks
+NUMCHK_RE = re.compile(r"(?<![\d.])(\d+\.\d+|\d{3,})(?!\.?\d)")
+POW_LOST_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)?\s*[×xX]\s*10([1-9]\d?)(?![\d.⁰¹²³⁴⁵⁶⁷⁸⁹])"  # 1 × 106, not × 100
+                         r"|(?<![\d.A-Za-z])10([1-9])\s*(?:CFU|cfu|copies|cells|个细胞|个菌)")  # 106 CFU for 10⁶ CFU
+PTAG_RE = re.compile(r"\[p(\d+)(?:\s*[-–,，]\s*p?(\d+))?\]")
+LONG_LINE = 2000
+UNIT_PAT = (r"(wt\s?%|%|°C|kDa|MPa|kPa|GPa|Pa|kHz|MHz|Hz|nm|μm|mm|cm|μL|mL|ng|μg|mg|kg|g|nM|μM|mM|mol|"
+            r"h|min|CFU|rpm|kV|mV|V|mW|W|J|eV|U|IU)(?![A-Za-z])")
+_NUM = r"\d+(?:\.\d+)?"
+NUM_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])(?<![A-Za-z][\u2212\u207b-])(" + _NUM + r")\s*" + UNIT_PAT)  # not mg L\u22121 min
+# in the source a unit may close a list or range: "6 and 24 h", "66.03 and 59.5%", "20 to 50 °C", "12-h", "565/578 nm"
+NUM_LIST_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])(" + _NUM + r"(?:\s*(?:,|，|and|or|to|vs\.?|–|—|-|~|/|、|×)\s*" + _NUM
+                              + r")*)\s*[-‐]?\s*" + UNIT_PAT)
+PM_RE = re.compile(r"(?<![\d.])(" + _NUM + r")\s*(?:±|\+/-|\+/−)\s*(" + _NUM + r")(?!\d|\.\d)")
+
+
+def norm_units(t: str) -> str:
+    """Spaces, degree signs, micro signs and full-width percent written one way, so that 37 \u25e6C = 37 \u00b0C."""
+    t = re.sub(r"[\u00a0\u2002-\u2009\u202f]", " ", t).replace("\uff05", "%")
+    t = norm_digits(t).replace("\u00b5", "\u03bc").replace("\u2103", "\u00b0C")
+    t = re.sub(r"[\u00b0\u25e6\u02da\u00ba\ufffd]\s*C(?![A-Za-z])", "\u00b0C", t)
+    return re.sub(r"(?<![A-Za-z])u(?=[gLM](?![A-Za-z]))", "\u03bc", t)
+
+
+NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+             "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+             "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+             "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+UNIT_WORDS = [(r"micrograms?", "\u03bcg"), (r"milligrams?", "mg"), (r"nanograms?", "ng"), (r"kilograms?", "kg"),
+              (r"grams?", "g"), (r"microlit(?:er|re)s?", "\u03bcL"), (r"millilit(?:er|re)s?", "mL"),
+              (r"micromet(?:er|re)s?|microns?", "\u03bcm"), (r"millimet(?:er|re)s?", "mm"),
+              (r"centimet(?:er|re)s?", "cm"), (r"nanomet(?:er|re)s?", "nm"), (r"minutes?|mins", "min"),
+              (r"hours?|hrs?", "h"), (r"micromolar", "\u03bcM"), (r"millimolar", "mM"), (r"nanomolar", "nM"),
+              (r"degrees? (?:Celsius|centigrade)", "\u00b0C"), (r"kilodaltons?", "kDa")]
+_UNIT_WORD_RE = re.compile(r"(?<![\d.A-Za-z])((?:\d+(?:\.\d+)?|[A-Za-z]+(?:-[A-Za-z]+)?)[\s\u2010-]+)("
+                           + "|".join(w for w, _ in UNIT_WORDS)
+                           + r")(?![A-Za-z])(?![\u2010-](?:positive|negative|stain|scale))", re.I)
+_TENS = "twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety"
+_ONES = "one|two|three|four|five|six|seven|eight|nine"
+_NUMWORD_RE = re.compile(r"(?<![A-Za-z])(?:(" + _TENS + r")[\s-]+(" + _ONES + r")|(" + "|".join(NUM_WORDS) + r"))"
+                         r"(?=[\s-]+" + UNIT_PAT + ")", re.I)
+
+
+def augment_source(src_text: str) -> str:
+    """The source plus a variant written the way a translation writes it, so that membership tests do not
+    flag faithful renderings: 'One milliliter' / 'Four-micrometer-thick' / 'Twenty micrograms' / '5 minutes'
+    -> 1 mL / 4-\u03bcm / 20 \u03bcg / 5 min; decimal commas (0,1 mg) -> 0.1; 'No.30013' -> No. 30013.
+    Only ever adds candidates; nothing in the source is hidden."""
+    def unit(m):  # only right after a number or a number word: '5 minutes', 'Four-micrometer', not 'Gram-negative'
+        lead = m.group(1).strip(" -\u2010").lower()
+        if not (re.fullmatch(r"\d+(?:\.\d+)?", lead) or all(x in NUM_WORDS for x in lead.split("-"))):
+            return m.group(0)
+        return m.group(1) + next(s for w, s in UNIT_WORDS if re.fullmatch(w, m.group(2), re.I))
+    t = _UNIT_WORD_RE.sub(unit, src_text)
+
+    def num(m):
+        if m.group(3):
+            return str(NUM_WORDS[m.group(3).lower()])
+        return str(NUM_WORDS[m.group(1).lower()] + NUM_WORDS[m.group(2).lower()])
+    t = _NUMWORD_RE.sub(num, t)
+    t = re.sub(r"(?<![\d,.])(\d+),(\d{1,2})(?![\d,])", r"\1.\2", t)
+    t = re.sub(r"(?<=[A-Za-z])\.(?=\d)", ". ", t)
+    t = re.sub(r"(?<=[a-z]{2})(?=" + _NUM + r"\s*[-\u2010]?\s*" + UNIT_PAT + ")", " ", t)  # 'into5 mL' (lost space)
+    return src_text if t == src_text else src_text + "\n\n" + t
+
+
+def src_num_context(src_text: str) -> tuple:
+    """(number, unit) pairs and (value, sd) pairs that occur in the source."""
+    t = norm_units(src_text)
+    pairs = set()
+    for m in NUM_LIST_UNIT_RE.finditer(t):
+        for a in re.findall(_NUM, m.group(1)):
+            pairs.add((a, m.group(2).replace(" ", "")))
+    return pairs, set(PM_RE.findall(t))
+
+
+def _cap_key(kind_label: str, num: str, src_kind: str | None = None) -> str:
+    """Comparable key for a caption: F3, FS2, T1, SC1 (a trailing panel letter is dropped)."""
+    num = re.sub(r"(?<=\d)[A-Za-z]$", "", num.strip())
+    kind = src_kind or ("table" if TABLE_LABEL_RE.search(kind_label) else
+                        "scheme" if SCHEME_LABEL_RE.search(kind_label) else "fig")
+    if kind == "table":
+        return "T" + num
+    if kind == "scheme":
+        return "SC" + num
+    if kind == "suppfig" and not num.startswith("S"):
+        num = "S" + num
+    return "F" + num
+
+
+def _cap_label(key: str) -> str:
+    if key.startswith("SC"):
+        return "方案 " + key[2:]
+    return ("表 " if key.startswith("T") else "图 ") + key[1:]
+
+
+def _cap_numbers(text: str, source: bool = False) -> set:
+    """Precise quantities of a caption: decimals, integers of 2+ digits, number + unit, value \u00b1 sd.
+    Figure references (Fig. 2a, \u56fe S3), citation markers and the caption label are removed first; lone small
+    integers (n = 3, often written as a word) are left out. In the source a unit may close a list (50 and 100 \u03bcm)."""
+    t = norm_units(augment_source(text) if source else text)
+    t = re.sub(r"\[\s*\d+(?:\s*[,\uff0c\u2013\-]\s*\d+)*\s*\]", " ", t)
+    t = re.sub(r"^\s*\**\s*[^\d\s*]{0,24}\s*S?\d{1,3}[A-Za-z]?\s*[.:\uff1a|]?\**", " ", t)  # the label
+    t = re.sub(r"[pP]\s*[<>\u2264\u2265]\s*0?\.\d+", " ", t)  # significance thresholds, often printed in the figure
+    t = FIGREF_RE.sub(" ", t)
+    out = set()
+    if source:
+        for m in NUM_LIST_UNIT_RE.finditer(t):
+            for a in re.findall(_NUM, m.group(1)):
+                out.add(f"{a} {m.group(2).replace(' ', '')}")
+    else:
+        for a, u in NUM_UNIT_RE.findall(t):
+            out.add(f"{a} {u.replace(' ', '')}")
+    for a, b in PM_RE.findall(t):
+        out.add(f"{a} \u00b1 {b}")
+    out.update(re.findall(r"(?<![\d.A-Za-z])(\d+\.\d+|\d{2,})(?!\d|\.\d)", t))
+    return out
+
+
+SCALE_RE = re.compile(r"标尺|比例尺|scale\s*bars?|bars?\s*[=:：]", re.I)
+
+
+def caption_issues(lines: list, L0: int, folder: str, pages: list) -> tuple:
+    """Compare every translated caption with the original caption of the same number (manifest.json, completed
+    from source.txt): quantities the original caption does not have (read off the figure, a scale bar, another
+    figure's caption), quantities of the original missing from the translation (a dropped half-sentence), and
+    captions whose numbers all belong to another figure. Returns (messages, body lines compared)."""
+    caps = load_manifest(folder).get("captions", [])
+    if not caps or not pages:
+        return [], set()
+    byp = {p: re.sub(r"\s+", " ", t) for p, t in pages}
+    starts = defaultdict(list)  # where each caption begins on its page
+    for c in caps:
+        txt = re.sub(r"\s+", " ", c.get("text", "")).strip()
+        i = byp.get(c.get("page"), "").find(txt[:30]) if txt else -1
+        starts[c.get("page")].append((i, c, txt))
+    src, head = {}, {}
+    for pg, lst in starts.items():
+        lst.sort(key=lambda x: x[0])
+        for n, (i, c, txt) in enumerate(lst):
+            k = _cap_key("", str(c.get("num", "")), c.get("kind"))
+            if i < 0:
+                win = txt
+            else:  # from this caption to the next one on the page (or 2,500 characters)
+                nxt = next((j for j, _, _ in lst[n + 1:] if j > i), None)
+                win = byp[pg][i:min(nxt if nxt is not None else len(byp[pg]), i + 2500)]
+            src[k] = (src[k] + " " + win) if k in src else win
+            cut = txt[:max(0, txt.rfind(" ", 0, max(0, len(txt) - 12)))]  # surely caption text, whole tokens only
+            head[k] = (head[k] + " " + cut) if k in head else cut
+    srcq = {k: _cap_numbers(v, source=True) for k, v in src.items()}
+    headq = {k: _cap_numbers(v, source=True) for k, v in head.items()}
+    extra, lost, swapped, covered = [], [], [], set()
+    groups = defaultdict(list)  # one figure may be captioned in several parts (图 4a、b / 图 4c、d)
+    for s, e, k in md_blocks(lines):
+        if k != "para" or not CAPLINE_RE.match(lines[s]) or META_LINE_RE.match(lines[s]):
+            continue
+        bold = re.match(r"\s*\*\*([^*]+)\*\*", lines[s])
+        labs = list(re.finditer(r"([^\d\s\uff1a:\u3001,]{0,8})\s*(S?\d{1,3})[A-Za-z]?", bold.group(1))) if bold else []
+        if not labs:
+            continue
+        key = _cap_key(labs[-1].group(1), labs[-1].group(2))  # 补充文件 1：图 S1 -> 图 S1
+        if key in srcq:
+            groups[key].append((s, e))
+    for key, spans in groups.items():
+        s0 = spans[0][0]
+        for s, e in spans:
+            covered.update(range(s, e))
+        text = " ".join(" ".join(lines[s:e]) for s, e in spans)
+        label, where = _cap_label(key), f"L{s0 + L0}"
+        tq, sq = _cap_numbers(text), srcq[key]
+        # swapped caption: its distinctive numbers (decimals, value \u00b1 sd; scale bars repeat across figures)
+        # are all absent from its own original caption and present in another one
+        dist = {q for q in tq if "." in q.split(" ")[0] or "\u00b1" in q}
+        if len(dist) >= 3 and not (dist & sq):
+            best = max(((len(dist & q), kk) for kk, q in srcq.items() if kk != key), default=(0, ""))
+            if best[0] >= max(3, len(dist) * 2 // 3):
+                swapped.append(f"{label} {where}（数字与原文{_cap_label(best[1])}的图注一致）")
+                continue
+        add = tq - sq
+        with_unit = {q.split(" ")[0] for q in add if " " in q}
+        add = sorted(q for q in add if " " in q or q not in with_unit)  # 100 \u03bcm, not also 100
+        tvals = {q.split(" ")[0] for q in tq}
+        tvals |= set(re.findall(r"\d+(?:\.\d+)?", text.translate(SUPERSCRIPT_DIGITS)))
+        miss = sorted(q for q in headq.get(key, set()) if " " not in q and q not in tvals)
+        if add:
+            extra.append((label, s0, add, text))
+        if miss:
+            lost.append(f"{label} {where}：{'、'.join(miss[:4])}")
+    out = []
+    if swapped:
+        out.append(("WARN", "图注可能张冠李戴：" + "；".join(swapped[:4])))
+    rows_out, n_scale = [], 0
+    for label, s0, add, text in extra:
+        flat = norm_units(re.sub(r"\s+", " ", text))
+        sc, ot = [], []
+        for q in add:
+            m = re.search(r"(?<![\d.])" + re.escape(q).replace(r"\ ", r"\s*") + r"(?!\d)", flat)
+            # same clause: back to the previous full stop, at most 60 characters (标尺：5 μm（B）；20 μm（D）)
+            before = re.split(r"[。！？]|\.\s", flat[max(0, m.start() - 60):m.start()])[-1] if m else ""
+            hits = list(SCALE_RE.finditer(before))
+            # 标尺：5 μm（B）；20 μm（D） counts; 标尺：100 μm；切片厚度为 30 μm does not (words in between)
+            gap = before[hits[-1].end():] if hits else ""
+            (sc if hits and len(re.findall(r"[\u4e00-\u9fff]", gap)) <= 4 else ot).append(q)
+        if sc:
+            n_scale += 1
+            rows_out.append(f"{label} L{s0 + L0} [标尺] 「{'、'.join(sc[:4])}」 {line_snip(text, sc[0])}")
+        if ot:
+            rows_out.append(f"{label} L{s0 + L0} 「{'、'.join(ot[:4])}」 {line_snip(text, ot[0])}")
+    if rows_out:
+        hint = f"标 [标尺] 的 {n_scale} 条是从图上读的标尺，原图注文字里没有就删掉；" if n_scale else ""
+        out.append(("WARN", f"图注里有原图注没有的数字或单位 {len(extra)} 条图注（{hint}其余：从图上读出、单位抄错或抄串了？"
+                            f"图注只译原图注）：" + details(rows_out)))
+    if lost:
+        out.append(("WARN", f"原图注里的数字译文图注里没有 {len(lost)} 条（可能漏译半句）："
+                            + "；".join(lost[:5]) + (" …" if len(lost) > 5 else "")))
+    return out, covered
+
+
+DETAIL_INDENT = "\n          "
+DETAIL_MAX = 6
+
+
+def line_snip(line: str, val: str, width: int = 70) -> str:
+    """A window of a translation line around a value (Markdown emphasis removed)."""
+    t = re.sub(r"\s+", " ", re.sub(r"\*\*|`", "", line)).strip()
+    i = -1
+    for probe in (val, val.split(" ")[0]):
+        m = re.search(r"(?<![\d.])" + re.escape(probe).replace(r"\ ", r"\s*"), norm_units(t))
+        if m:
+            i = m.start()
+            break
+    i = max(i, 0)
+    s = max(0, i - width // 2)
+    e = min(len(t), s + width)
+    return ("…" if s else "") + t[s:e] + ("…" if e < len(t) else "")
+
+
+def src_snip(num: str, pages_n: dict, near, unit: str = "", width: int = 56) -> str:
+    """Where a bare number occurs in the source: first an occurrence with a unit of the same kind (150\u2013250 mm
+    for 250 \u03bcm), then any unit, then none; within each, the translation line's page \u00b11 first. Small
+    integers with no unit nearby are not shown (they occur everywhere and would only mislead)."""
+    rx = re.compile(r"(?<![\d.])" + re.escape(num) + r"(?!\d|\.\d)")
+    base = unit[-1:].lower() if unit else ""
+    best = None
+    for p, t in pages_n.items():
+        for m in rx.finditer(t):
+            after = t[m.end():m.end() + 8]
+            um = re.match(r"\s*[-\u2010]?\s*" + UNIT_PAT, after)
+            kind = 0 if (um and base and um.group(1)[-1:].lower() == base) else (1 if um else 2)
+            dist = 0 if near and abs(p - near) <= 1 else 1
+            key = (kind, dist, abs(p - (near or p)))
+            if best is None or key < best[0]:
+                best = (key, p, m)
+    if best is None:
+        return ""
+    (kind, _, _), p, m = best
+    if kind == 2 and not ("." in num or len(num) >= 3):
+        return ""
+    t = pages_n[p]
+    s = max(0, m.start() - width // 2)
+    e = min(len(t), s + width)
+    return f"原文 p{p}：" + ("…" if s else "") + re.sub(r"\s+", " ", t[s:e]) + ("…" if e < len(t) else "")
+
+
+def details(rows: list) -> str:
+    """Indented detail lines under a warning (the first DETAIL_MAX)."""
+    out = rows[:DETAIL_MAX]
+    if len(rows) > DETAIL_MAX:
+        out.append(f"…另 {len(rows) - DETAIL_MAX} 处")
+    return "".join(DETAIL_INDENT + r for r in out)
+
+
+def number_issues(lines: list, L0: int, stop: int, src_text: str, skip: set | None = None,
+                  pages: list | None = None, lp: list | None = None) -> list:
+    """Numbers in the translation that do not occur anywhere in the source text; number + unit and value \u00b1 sd
+    combinations that do not occur in the source (wrong unit, wrong pairing, a value read off a figure); powers
+    of ten that probably lost their superscript (1 \u00d7 106, 106 CFU). Headings, image links and references are
+    skipped. A number that occurs in the source may still sit in the wrong group: that is not checked.
+    Every finding is listed with the translation line around it (and, for combinations, where the bare number
+    sits in the source), so most can be judged without opening a file."""
+    aug = augment_source(src_text)
+    srcnums = set(NUMCHK_RE.findall(norm_digits(aug)))
+    spairs, spm = src_num_context(aug)
+    pages_n = {p: norm_units(t) for p, t in (pages or [])}
+    skip = skip or set()
+    miss, powlost, ctx, in_code = [], [], [], False
+    for i, ln in enumerate(lines[:stop]):
+        st = ln.strip()
+        if st.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not st or st.startswith(("#", "![", "<!--")):
+            continue
+        t = re.sub(r"<sup>.*?</sup>|\[\s*\d+(?:\s*[,，–\-]\s*\d+)*\s*\]", " ", ln)  # citation markers are not data
+        t = norm_digits(re.sub(r"\]\([^)]*\)", "]", t))
+        t = re.sub(r"(?:https?://|www\.)\S+|\b[\w.-]+\.(?:org|com|net|edu|gov|cn|de|uk|io)/\S*|\b10\.\d{4,9}/\S+", " ", t)
+        lost_spans = []
+        for m in POW_LOST_RE.finditer(t):
+            powlost.append((i, m.group(0).strip()))
+            lost_spans.append((m.start(), m.end()))
+        if i in skip:  # captions are compared with their own original caption by caption_issues
+            continue
+        missing_here = set()
+        for m in NUMCHK_RE.finditer(t):
+            if any(a <= m.start() < b for a, b in lost_spans):
+                continue
+            v = m.group(1)
+            if v in srcnums or re.match(r"\s*[万亿千]", t[m.end():]):
+                continue
+            miss.append((i, v))
+            missing_here.add(v)
+        tu = norm_units(t)
+        for m in PM_RE.finditer(tu):
+            a, b = m.group(1), m.group(2)
+            if (a, b) not in spm and not ({a, b} & missing_here):
+                ctx.append((i, f"{a} ± {b}"))
+        for m in NUM_UNIT_RE.finditer(tu):
+            a, u = m.group(1), m.group(2).replace(" ", "")
+            if a in missing_here or any(x <= m.start() < y for x, y in lost_spans):
+                continue
+            if (a, u) not in spairs:
+                ctx.append((i, f"{a} {m.group(2)}"))
+
+    def page_of(i):
+        return lp[i] if lp and i < len(lp) else None
+
+    def rows(items, with_src=False):
+        out, seen = [], set()
+        for i, v in items:
+            if (i, v) in seen:  # the same value twice on one line: one row
+                continue
+            seen.add((i, v))
+            r = f"L{i + L0} 「{v}」 {line_snip(lines[i], v)}"
+            if with_src and pages_n:
+                parts = v.split(" ")
+                ss = src_snip(parts[0], pages_n, page_of(i), parts[1] if len(parts) == 2 else "")
+                if ss:
+                    r += f"  ｜{ss}"
+            out.append(r)
+        return out
+    out = []
+    if powlost:
+        r = rows(powlost)
+        out.append(("WARN", f"疑似丢了上标的 10 的幂 {len(r)} 处（应为 10⁶ 之类？对照原页）：" + details(r)))
+    if miss:
+        r = rows(miss)
+        out.append(("WARN", f"原文中找不到的数字 {len(r)} 处（抄错、换算、从图上读数，或译者自己加的说明？）：" + details(r)))
+    if ctx:
+        r = rows(ctx, True)
+        out.append(("WARN", f"数字在原文里有，但这个「数字 + 单位」或「均值 ± SD」组合原文没有 {len(r)} 处"
+                            f"（单位抄错、配错组、标尺、从图上读数，或原文提取丢了 μ？对照右侧原文）：" + details(r)))
+    return out
+
+
+def key_result_issues(kr: str, pages: list) -> list:
+    """Each '；'-separated result must carry [pN]; its numbers must occur on that source page (±1)."""
+    if not kr.strip():
+        return []
+    byno = {p: norm_digits(t) for p, t in pages}
+    out = []
+    segs = [s.strip() for s in re.split(r"[；;]", kr) if s.strip()]
+    untagged = []
+    for k, seg in enumerate(segs, 1):
+        tags = PTAG_RE.findall(seg)
+        nums = [x for x in NUM_TOKEN_RE.findall(norm_digits(PTAG_RE.sub("", seg))) if "." in x or len(x) >= 2]
+        if not tags:
+            untagged.append(str(k))
+            continue
+        if not byno or not nums:
+            continue
+        allowed = set()
+        for a, b in tags:
+            lo, hi = int(a), int(b) if b else int(a)
+            allowed.update(range(lo - 1, hi + 2))
+        have = set(NUM_TOKEN_RE.findall(" ".join(byno.get(p, "") for p in allowed)))
+        lost = [x for x in nums if x not in have]
+        if lost:
+            where = "、".join(f"p{a}" + (f"-{b}" if b else "") for a, b in tags)
+            out.append(("WARN", f"key_result 第 {k} 条的 {', '.join(lost[:4])} 不在原文 {where}（±1 页）"))
+    if untagged:
+        sugg = []
+        for k in untagged:
+            seg = segs[int(k) - 1]
+            nums = {x for x in NUM_TOKEN_RE.findall(norm_digits(seg)) if "." in x or len(x) >= 3}
+            if not nums or not byno:
+                continue
+            have = {p: len(nums & set(NUM_TOKEN_RE.findall(t))) for p, t in byno.items()}
+            top = max(have.values())
+            best = [p for p, c in have.items() if c == top]
+            if top and top >= (len(nums) + 1) // 2 and len(best) <= (3 if top >= 2 else 1):
+                sugg.append(f"第 {k} 条 " + "/".join(f"[p{p}]" for p in sorted(best)) + f"（{top}/{len(nums)} 个数字在该页）")
+        hint = f"（按数字推断：{'；'.join(sugg)}；核对后补上）" if sugg else ""
+        out.append(("WARN", f"key_result 第 {'、'.join(untagged)} 条没有页码 [pN]{hint}"))
+    return out
+
+
+def find_fields_file(folder: str) -> str | None:
+    d = os.path.abspath(folder)
+    for _ in range(4):
+        p = os.path.join(d, "_fields.md")
+        if os.path.isfile(p):
+            return p
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return None
+
+
+VALUES_HEAD_RE = re.compile(r"取值|允许值|可选值|候选值|allowed|values?", re.I)
+
+
+def _fields_table(path: str) -> list:
+    """Data rows of the Markdown table(s) in _fields.md as (cells, value_column_or_None); each table's own
+    header decides whether it has a value column (取值 / allowed values, third column or later)."""
+    rows = [ln.strip() for ln in open(path, encoding="utf-8", errors="replace").read().splitlines()
+            if ln.strip().startswith("|")]
+    sep_re = re.compile(r"\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?")
+    cells = lambda r: [c.strip() for c in r.strip().strip("|").split("|")]  # noqa: E731
+    out, vcol = [], None
+    for i, r in enumerate(rows):
+        if sep_re.fullmatch(r):
+            continue
+        if i + 1 < len(rows) and sep_re.fullmatch(rows[i + 1]):  # a header row: starts a new table
+            vcol = next((k for k, c in enumerate(cells(r)) if k >= 2 and VALUES_HEAD_RE.search(c)), None)
+            continue
+        out.append((cells(r), vcol))
+    return out
+
+
+def parse_fields_file(path: str) -> list:
+    """[(field, description)] from the Markdown table in _fields.md (header row and separator skipped;
+    an optional value column is not part of the description)."""
+    out = []
+    for c, vcol in _fields_table(path):
+        if len(c) < 2:
+            continue
+        name = c[0].strip("`* ")
+        if re.fullmatch(r"[A-Za-z_][\w.\-]*", name):
+            out.append((name, "|".join(x for k, x in enumerate(c[1:], 1) if k != vcol).strip()))
+    return out
+
+
+def parse_field_values(path: str) -> dict:
+    """{field: [allowed values]} from the optional value column (取值 / allowed values) of _fields.md.
+    Values are separated by / 、 ， or ；. 「无」 and 「未报告」 are always allowed."""
+    out = {}
+    for c, vcol in _fields_table(path):
+        if vcol is not None and len(c) > vcol and c[vcol].strip():
+            vals = [v.strip(" `*") for v in re.split(r"\s*[/、，,；;]\s*", c[vcol]) if v.strip(" `*")]
+            if vals:
+                out[c[0].strip("`* ")] = vals
+    return out
+
+
+def field_issues(fields: dict, defs: list, values: dict | None = None) -> list:
+    out, missing = [], []
+    for name, desc in defs:
+        v = str(fields.get(name, "")).strip()
+        if not v:
+            missing.append(name)
+            continue
+        allowed = (values or {}).get(name)
+        if allowed and "①" not in desc:
+            ok = set(allowed) | {"无", "未报告"}
+            got = [x.strip() for x in re.split(r"\s*[；;、/]\s*", v) if x.strip()]
+            bad = [x for x in got if x not in ok and re.sub(r"[（(].*?[)）]$", "", x).strip() not in ok]
+            if bad:
+                out.append(("WARN", f"字段 {name} 的取值「{'」「'.join(bad[:4])}」不在 _fields.md 列出的取值里"
+                                    f"（{' / '.join(allowed)}；多个值用「；」分隔，可加括号注释）"))
+        if "①" in desc and v not in ("无", "未报告", "none", "n/a"):
+            if not v.startswith(tuple(CIRCLED)):
+                out.append(("WARN", f"字段 {name} 要按 ①②③ 编号逐条写（见 _fields.md）"))
+                continue
+            labels = re.findall(r"‖\s*([^\s：:`|]{1,12})\s*[：:]", desc)
+            entries = [e for e in ENTRY_SPLIT_RE.split(v) if e.strip()]
+            for lab in labels:
+                bad = [e[0] for e in entries if not re.search(rf"‖\s*{re.escape(lab)}\s*[：:]", e)]
+                if bad:
+                    out.append(("WARN", f"字段 {name} 的第 {''.join(bad)} 条缺「‖ {lab}：」部分"))
+    if missing:
+        out.append(("WARN", f"缺少工作区字段（_fields.md）：{', '.join(missing)}；没有就写「无」，原文没交代写「未报告」"))
+    return out
+
+
+def prose_blocks(page_text: str) -> list:
+    """Real paragraphs of a source page: blocks of 150+ characters that are not captions.
+    Labels extracted from inside figures are short fragments and do not count."""
+    return [b for b in re.split(r"\n\s*\n", page_text) if len(b.strip()) >= 150 and not CAP_RE.match(b)]
+
+
+def prose_chars(page_text: str) -> int:
+    return sum(len(re.sub(r"\s", "", b)) for b in prose_blocks(page_text))
+
+
+def page_coverage_issues(lines: list, r: dict, pages: list) -> list:
+    """Pages whose source has plenty of running text but whose translation is almost empty. Paragraphs count
+    on the page decided by plan_anchors; tables count on the page of their anchor (source tables are text too)."""
+    tr = Counter()
+    for t, p in zip(r["texts"], r["new"]):
+        if p is not None:
+            tr[p] += len(re.sub(r"\s", "", t))
+    lp = line_pages(lines, r["blocks"])
+    for s, e, k in r["blocks"]:
+        if k == "table" and lp[s] is not None:
+            tr[lp[s]] += sum(len(re.sub(r"[\s|:\-]", "", lines[x])) for x in range(s, e))
+    cand = [(p, prose_chars(t)) for p, t in pages]
+    cand = [(p, n) for p, n in cand if n >= 1200 and tr[p] < 0.12 * n]
+    if not cand:
+        return []
+    # A paragraph that starts on page p-1 and runs across a figure page belongs to p-1 (one block, one page),
+    # so the page it continues onto looks empty. The numbers found only on this source page survive translation:
+    # nearly all of them in the translation just before or at this page = the text is there (a continued
+    # paragraph); most of them missing from the whole translation = omission. Words are not used for the credit:
+    # English words do not survive translation, so their share cannot tell a whole page from a fragment.
+    ptok = {p: sig_tokens(" ".join(prose_blocks(t))) for p, t in pages}
+    df = Counter(x for s in ptok.values() for x in s)
+    utok = [sig_tokens(t) for t in r["texts"]]
+    alltr = set().union(*utok) if utok else set()
+    pc = {p: prose_chars(t) for p, t in pages}
+    # translation chars per source prose char, from the pages that are not suspect (a missing page must not
+    # lower the yardstick it is measured with)
+    okp = [q for q in pc if q not in {c for c, _ in cand} and pc[q] >= 300]
+    ratio = sum(tr[q] for q in okp) / max(1, sum(pc[q] for q in okp)) if len(okp) >= 2 else None
+    thin = []
+    for p, n in cand:
+        own = {x for x in ptok[p] if df[x] == 1}
+        nums = {x for x in own if re.fullmatch(r"\d+(?:\.\d+)?", x)}
+        near = set()
+        for k, q in enumerate(r["new"]):
+            if q is not None and p - 3 <= q <= p + 1:
+                near |= utok[k]
+        if len(nums) >= 3 and len(nums & near) >= 0.8 * len(nums):
+            continue  # continued paragraph: this page's own numbers sit in the translation just before
+        if len(nums) < 3 and ratio:  # no numbers to go by: enough translation for this page and the two before?
+            win = [q for q in pc if p - 2 <= q <= p]
+            if sum(tr[q] for q in win) >= 0.75 * ratio * sum(pc[q] for q in win):
+                continue
+        note = ""
+        if len(nums) >= 3 and len(nums & alltr) < 0.3 * len(nums):
+            note = f"；该页独有的 {len(nums)} 个数字译文里只有 {len(nums & alltr)} 个"
+        elif len(nums) < 3:
+            note = f"；该页没有足够的数字可比对，用 pair --page {p} 对照原文看一眼"
+        thin.append(f"p{p}（原文正文 {n} 字，译文 {tr[p]} 字{note}）")
+    if thin:
+        return [("WARN", f"这些页译文明显偏少，可能漏译：{'；'.join(thin[:6])}")]
+    return []
+
+
+def v3_checks(folder: str, doc: dict, lines: list, L0: int, ref_i, anchors: list) -> list:
+    msgs = []
+    longl = [i + L0 for i, ln in enumerate(lines) if len(ln) > LONG_LINE]
+    if longl:
+        msgs.append(("WARN", f"超过 {LONG_LINE} 字的行 {len(longl)} 处（读文件工具会截断；在句末换行，不加空行）："
+                             f"行 {', '.join(map(str, longl[:6]))}"))
+    pages = source_pages(folder)
+    fields = doc["fields"]
+    if not pages:
+        why = "没有分页标记 <<<PAGE n>>>" if source_path(folder) else "没有 _work/source.txt"
+        msgs.append(("WARN", f"{why}：数字、页码锚点和 key_result 页码都没有核对（用原 PDF 运行 extract 后再 check）"))
+    if pages:
+        stop = ref_i if ref_i is not None else len(lines)
+        cmsgs, covered = caption_issues(lines, L0, folder, pages)
+        lp_all = line_pages(lines)
+        msgs += number_issues(lines, L0, stop, "\n".join(t for _, t in pages), covered, pages, lp_all) + cmsgs
+        if anchors:
+            r = plan_anchors(doc, pages)
+            moved = [(r["units"][k], o, w) for k, (o, w) in enumerate(zip(r["old"], r["new"])) if o != w]
+            if moved:
+                msgs.append(("WARN", f"页码锚点与原文对不上 {len(moved)} 段（"
+                                     + "、".join(f"L{li + L0} p{o}→p{w}" for li, o, w in moved[:4])
+                                     + "）→ 运行 anchor 自动校正"))
+            if str(fields.get("anchors", "")).strip() != "auto":  # auto-placed pages are too soft to judge omissions
+                msgs += page_coverage_issues(lines, r, pages)
+    if doc["has_yaml"]:
+        kr = str(fields.get("key_result", ""))
+        msgs += key_result_issues(kr, pages)
+        ff = find_fields_file(folder)
+        if ff:
+            msgs += field_issues(fields, parse_fields_file(ff), parse_field_values(ff))
+    return msgs
+
+
+def cmd_refresh(a) -> int:
+    """Re-run extract for papers whose _work/ came from an older pdftrans, using the PDF path recorded in their
+    manifest.json (or the file of the same name in --pdf-dir, given by the user). Rewrites only _work/source.txt,
+    refs.md and manifest.json (recorded figures kept); never the translation or the images. Refuses a paper
+    whose new page count differs from the old one (the anchors would no longer match)."""
+    import tempfile
+    if not os.path.isdir(a.root):
+        die(f"不是文件夹：{a.root}")
+    n = done = skipped = 0
+    for name, folder in iter_papers(a.root):
+        old = load_manifest(folder)
+        if not old:
+            continue
+        n += 1
+        rec = old.get("pdf") or ""
+        pdf = rec if rec and os.path.isfile(rec) else None
+        if not pdf and a.pdf_dir and rec:
+            cand = os.path.join(a.pdf_dir, re.split(r"[\\/]", rec)[-1])
+            pdf = cand if os.path.isfile(cand) else None
+        tool = old.get("tool", "?")
+        if not pdf:
+            print(f"[跳过] {name}  找不到 manifest.json 记录的 PDF：{rec or '（没有记录）'}"
+                  + ("" if a.pdf_dir else "；PDF 搬过家就加 --pdf-dir 指向现在的文件夹"))
+            skipped += 1
+            continue
+        if tool == f"pdftrans {VERSION}" and not a.force:
+            print(f"[OK]   {name}  已是 {tool} 提取的")
+            continue
+        if a.dry_run:
+            print(f"[将重提] {name}  {tool} → pdftrans {VERSION}  （{pdf}）")
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_extract(argparse.Namespace(pdf=pdf, outdir=tmp))
+            new = load_manifest(tmp)
+            if old.get("pages") and new.get("pages") != old.get("pages"):
+                print(f"[拒绝] {name}  新提取 {new.get('pages')} 页，原来 {old.get('pages')} 页：PDF 可能不是同一份，未改动")
+                skipped += 1
+                continue
+            wd = work_dir(folder)
+            bdir = os.path.join(wd, "backup")
+            os.makedirs(bdir, exist_ok=True)
+            for fn in ("source.txt", "refs.md", "manifest.json"):
+                src, bak = os.path.join(wd, fn), os.path.join(bdir, fn.replace(".", ".before-refresh.", 1))
+                if os.path.isfile(src) and not os.path.exists(bak):
+                    shutil.copyfile(src, bak)
+            new["figures"] = old.get("figures", [])
+            new["pdf"] = rec if rec and os.path.isfile(rec) else pdf
+            for fn in ("source.txt", "refs.md"):
+                t = os.path.join(tmp, WORK, fn)
+                if os.path.isfile(t):
+                    shutil.copyfile(t, os.path.join(wd, fn))
+            save_manifest(folder, new)
+        fixes = (new.get("symbol_fixes") or {}).get("count", 0)
+        print(f"[重提] {name}  {tool} → pdftrans {VERSION}；符号字体还原 {fixes} 处（旧文件在 _work/backup/）")
+        done += 1
+    if not n:
+        die("没找到带 _work/manifest.json 的文献文件夹", 1)
+    tail = "预览，未改动文件" if a.dry_run else f"重新提取 {done} 篇"
+    print(f"\n共 {n} 篇，{tail}" + (f"；跳过 {skipped} 篇" if skipped else ""))
+    return 0
+
+
+def cmd_selftest(a) -> int:
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    test = os.path.join(here, "..", "tests", "test_pdftrans.py")
+    if not os.path.isfile(test):
+        die("找不到 tests/test_pdftrans.py（技能包不完整？）", 1)
+    return subprocess.call([sys.executable, test, os.path.abspath(__file__)])
+
+
+# ----------------------------------------------------------------------------- v3.2: wrap
+WRAP_AT = 1500   # lines longer than this are wrapped (spec: paragraphs over 1,500 characters)
+WRAP_TO = 1000   # target length of the wrapped lines
+SENT_END_RE = re.compile(r"(?:[。！？]|(?<=[a-z0-9)\]])\.(?=\s+[A-Z(]))[”’」』）)\]]*")
+
+
+BLOCK_START_RE = re.compile(r"(?:[-*+]\s|\d{1,4}[.)]\s|#|>|\||```|~~~|!\[|<!--|-{3,}|\*{3,}|_{3,}|\$\$)")
+
+
+def wrap_line(ln: str) -> list:
+    """Split one long paragraph line at sentence ends into lines of about WRAP_TO characters. Joining the
+    result (Chinese: nothing, English: the space that was there) gives back the line exactly."""
+    cuts, last = [], 0
+    for m in SENT_END_RE.finditer(ln):
+        e = m.end()
+        nxt = ln[e:].lstrip(" ")
+        if BLOCK_START_RE.match(nxt):  # a line starting '1. ', '- ', '#', '>', '|' … would become another block
+            continue
+        if e - last >= WRAP_TO and e < len(ln):
+            cuts.append(e)
+            last = e
+    if not cuts:
+        return [ln]
+    parts, prev = [], 0
+    for c in cuts:
+        parts.append(ln[prev:c])
+        prev = c
+    parts.append(ln[prev:])
+    out = [parts[0].rstrip(" ")] + [p.lstrip(" ") for p in parts[1:]]
+    return out if all(out) else [ln]
+
+
+def cmd_wrap(a) -> int:
+    if not os.path.isdir(a.path):
+        die(f"不是文件夹：{a.path}")
+    n = changed = refused = 0
+    for name, folder in iter_papers(a.path):
+        doc = load_translation(folder)
+        if not doc:
+            continue
+        n += 1
+        if doc["fatal"] or doc["errs"]:
+            print(f"[拒绝] {name}  {doc['fatal'] or 'YAML 头有问题：' + doc['errs'][0]}")
+            refused += 1
+            continue
+        lines = doc["lines"]
+        new, hits, skipped = [], [], []
+        kinds = {}
+        for s, e, k in md_blocks(lines):
+            for x in range(s, e):
+                kinds[x] = k
+        for i, ln in enumerate(lines):
+            if (len(ln) > WRAP_AT and kinds.get(i) == "para" and not CAPLINE_RE.match(ln)
+                    and not CAPSTART_RE.match(ln) and not ANCHOR_RE.search(ln)):
+                parts = wrap_line(ln)
+                if len(parts) > 1:
+                    hits.append((i + doc["off"], len(ln), len(parts)))
+                elif len(ln) > LONG_LINE:
+                    skipped.append(f"L{i + doc['off']} 段落 {len(ln)} 字（找不到合适的句末）")
+                new += parts
+            else:
+                if len(ln) > LONG_LINE:
+                    why = {"table": "表格行", "item": "列表项", "code": "代码", "heading": "标题"}.get(kinds.get(i), "图注或其他")
+                    skipped.append(f"L{i + doc['off']} {why} {len(ln)} 字")
+                new.append(ln)
+        skip_note = ("\n    没有折行、需要人工处理的长行：" + "；".join(skipped[:8])) if skipped else ""
+        if not hits:
+            print(f"[OK]   {name}  没有可以自动折行的长行{skip_note}")
+            continue
+        sq = lambda t: re.sub(r"\s+", "", t)  # noqa: E731
+        if sq("\n".join(new)) != sq(doc["body"]):  # never change a character, only where lines break
+            print(f"[拒绝] {name}  折行后文字与原文不一致（脚本缺陷，未写入），请报告")
+            refused += 1
+            continue
+        verb = "将" if a.dry_run else "已"
+        print(f"[折行] {name}  {verb}在句末折开 {len(hits)} 行：" + "、".join(f"L{l}（{c} 字 → {p} 行）" for l, c, p in hits[:6])
+              + skip_note)
+        if doc["normalized"]:
+            print(f"    编码规范化：{'、'.join(doc['normalized'])}（写入时一并生效）")
+        if a.dry_run:
+            continue
+        bdir = os.path.join(work_dir(folder), "backup")
+        os.makedirs(bdir, exist_ok=True)
+        bak = os.path.join(bdir, re.sub(r"\.md$", "", doc["name"]) + ".before-wrap.md")
+        if not os.path.exists(bak):
+            shutil.copyfile(doc["path"], bak)
+        prefix = doc["text"][:len(doc["text"]) - len(doc["body"])]
+        write_atomic(doc["path"], prefix + "\n".join(new))
+        changed += 1
+    if not n:
+        die("没找到译稿", 1)
+    tail = "预览，未改动文件" if a.dry_run else f"改动 {changed} 篇（改动前的原稿在 _work/backup/）"
+    print(f"\n共 {n} 篇，{tail}" + (f"；拒绝处理 {refused} 篇" if refused else ""))
+    return 1 if refused else 0
+
+
+# ----------------------------------------------------------------------------- v3.2: pair
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + f"\n…（截断，另有 {len(text) - limit} 字）"
+
+
+def pair_view(name: str, folder: str, doc: dict, pages: list, p: int, limit: int) -> str:
+    """Source page p (running headers/footers left out) next to the translation under the <!-- pN --> anchor,
+    plus the paragraph that starts just before the anchor (a paragraph that begins on the previous page and
+    runs onto this one is anchored there, so its second half belongs here)."""
+    clean, nrun = strip_running(pages)
+    src = dict(clean).get(p)
+    if src is None:
+        return ""
+    sp = source_path(folder)
+    sline = next((i + 1 for i, ln in enumerate(open(sp, encoding="utf-8", errors="replace"))
+                  if SRC_PAGE_RE.fullmatch(ln.strip()) and int(SRC_PAGE_RE.fullmatch(ln.strip()).group(1)) == p), None)
+    lines, off = doc["lines"], doc["off"]
+    blocks = md_blocks(lines)
+    lp = line_pages(lines, blocks)
+    body = [(s, e, k) for s, e, k in blocks if k not in ("blank", "anchor") and lp[s] == p]
+    # the paragraph right before this page's text (figures, captions and tables in between are floats and are
+    # skipped; a heading in between means nothing runs over)
+    prev = None
+    first = body[0][0] if body else next((s for s, e, k in blocks if lp[s] is not None and lp[s] > p), len(lines))
+    for s, e, k in reversed([b for b in blocks if b[0] < first]):
+        if k in ("blank", "anchor", "image", "table") or CAPLINE_RE.match(lines[s]) or CAPSTART_RE.match(lines[s]):
+            continue
+        if k in ("para", "item", "quote") and lp[s] is not None and lp[s] < p:
+            prev = (s, e, lp[s])
+        break
+    head = f"== {name} · p{p} =="
+    out = [head, f"-- 原文 p{p}（_work/source.txt 第 {sline} 行起；页眉页脚已略去）--" if sline else f"-- 原文 p{p} --",
+           _clip(src.strip(), limit)]
+    if body:
+        span = f"L{body[0][0] + off}–L{body[-1][1] - 1 + off}"
+    else:
+        span = "这一页的锚点下没有正文"
+    out.append(f"-- 译文 p{p}（{span}）--")
+    tr = []
+    if prev:
+        s, e, pg = prev
+        tr.append(f"[L{s + off}，p{pg} 起头的段落，后半段可能属于本页] " + " ".join(lines[x].strip() for x in range(s, e)))
+    for s, e, k in body:
+        txt = " ".join(lines[x].strip() for x in range(s, e))
+        if k == "image":
+            m = IMG_RE.search(txt)
+            txt = f"[图片 {m.group(1) if m else txt}]"
+        tr.append(f"[L{s + off}] {txt}")
+    out.append(_clip("\n".join(tr) if tr else "（无）", limit))
+    return "\n".join(out)
+
+
+def sample_pages(name: str, doc: dict, pages: list, k: int, seed) -> list:
+    """k body pages with real running text, before the reference list; reproducible for a given seed
+    (default: derived from the paper's folder name, so the same pages come back every time)."""
+    import random
+    import zlib
+    lines = doc["lines"]
+    blocks = md_blocks(lines)
+    lp = line_pages(lines, blocks)
+    ref_page = None
+    for s, e, kk in blocks:
+        if kk == "heading" and REF_TITLE_RE.search(lines[s]) and lp[s]:
+            ref_page = lp[s]
+    cands = [p for p, t in pages if prose_chars(t) >= 600 and (ref_page is None or p < ref_page)]
+    rnd = random.Random(seed if seed is not None else zlib.crc32(name.encode("utf-8")))
+    return sorted(rnd.sample(cands, min(k, len(cands))))
+
+
+def cmd_pair(a) -> int:
+    if not os.path.exists(a.path):
+        die(f"找不到：{a.path}")
+    path = os.path.dirname(a.path) if os.path.isfile(a.path) else a.path
+    picks = [x for x in (a.page, a.line, a.sample) if x is not None]
+    if len(picks) != 1:
+        die("要指定且只能指定一个：--page N、--line L 或 --sample K", 1)
+    if picks[0] < 1:
+        die("--page / --line / --sample 要是正整数", 1)
+    shown = 0
+    for name, folder in iter_papers(path):
+        doc = load_translation(folder)
+        pages = source_pages(folder)
+        if not doc or doc["fatal"] or not pages:
+            print(f"== {name} ==\n（{'没有译稿' if not doc else doc['fatal'] or '没有带分页标记的 source.txt'}）\n")
+            continue
+        if a.page:
+            want = [a.page]
+        elif a.line:
+            i = a.line - doc["off"]
+            lp = line_pages(doc["lines"])
+            if not 0 <= i < len(lp) or lp[i] is None:
+                print(f"== {name} ==\n（第 {a.line} 行不在正文页码锚点范围内）\n")
+                continue
+            want = [lp[i]]
+        else:
+            want = sample_pages(name, doc, pages, a.sample, a.seed)
+        if not want:
+            print(f"== {name} ==\n（没有正文足够长的页可抽）\n")
+        for p in want:
+            v = pair_view(name, folder, doc, pages, p, a.max_chars)
+            if not v:
+                print(f"== {name} · p{p} ==\n（原文没有第 {p} 页；共 {len(pages)} 页）\n")
+                continue
+            print(v + "\n")
+            shown += 1
+    if not shown:
+        die("没有可对照的页", 1)
+    return 0
+
+
+# ----------------------------------------------------------------------------- v3: find
+ROLE_RES = [("方法", re.compile(r"方法|材料与|实验部分|实验设计|实验方案|动物实验|methods?\b|materials|experimental|procedures?", re.I)),
+            ("结果", re.compile(r"结果|results?\b|findings", re.I)),
+            ("讨论", re.compile(r"讨论|discussion", re.I)),
+            ("结论", re.compile(r"结论|总结|结语|conclusions?", re.I)),
+            ("摘要", re.compile(r"摘要|abstract|summary", re.I)),
+            ("引言", re.compile(r"引言|前言|背景|introduction|background", re.I))]
+ROLE_WEIGHT = {"方法": 3, "结果": 3, "摘要": 2, "讨论": 1, "结论": 1, "": 1, "引言": 0}
+CITE_RE = re.compile(r"\[\d+(?:\s*[,，–\-]\s*\d+)*\]|(?<=[A-Za-z一-鿿）)\].,，。])[¹²³⁴⁵⁶⁷⁸⁹⁰]{1,3}(?:[,，–-][¹²³⁴⁵⁶⁷⁸⁹⁰]{1,3})*"
+                     r"|et al\.?,?\s*\(?\d{4}|等[，,]\s*\d{4}")
+NEG_ZH_RE = re.compile(r"(非|未|无|不|没有)\S{0,2}$")
+NEG_EN_RE = re.compile(r"\b(non|not|without|no|un)[\s-]?\w{0,4}[\s-]?$", re.I)
+
+
+def _src_blocks(slines: list) -> tuple:
+    """Blocks of source.txt as (first_line_index, text, first_line), plus the page of every line.
+    A <<<PAGE n>>> marker ends the block before it and is never part of a block (the first paragraph of
+    every page is searchable)."""
+    out, cur, first, page, spage = [], [], None, None, []
+
+    def flush():
+        if cur:
+            out.append((first, " ".join(cur), cur[0]))
+            cur.clear()
+
+    for i, ln in enumerate(slines):
+        m = SRC_PAGE_RE.fullmatch(ln.strip())
+        if m:
+            flush()
+            page = int(m.group(1))
+            spage.append(page)
+            continue
+        spage.append(page)
+        if not ln.strip():
+            flush()
+            continue
+        if not cur:
+            first = i
+        cur.append(ln.strip())
+    flush()
+    return out, spage
+
+
+def _snippet(text: str, rx, width: int, ands: list | None = None) -> str:
+    """Window around the main match; with --and terms, the closest main/and pair is shown together
+    (two short windows joined by ' … ' when they are far apart), so the reader sees why it matched."""
+    t = re.sub(r"\*\*|`|<!--.*?-->", "", text)  # underscores stay: they are part of names like in_vivo
+    t = re.sub(r"\s+", " ", t).strip()
+    mains = [m.span() for m in rx.finditer(t)] or [(0, 0)]
+    others = [m.span() for r in (ands or []) for m in r.finditer(t)]
+    if others:
+        a, b = min(((x, y) for x in mains for y in others), key=lambda p: abs(p[0][0] - p[1][0]))
+        lo, hi = min(a[0], b[0]), max(a[1], b[1])
+        if hi - lo <= width - 10:
+            s = max(0, lo - (width - (hi - lo)) // 2)
+            e = min(len(t), s + width)
+            return ("…" if s else "") + t[s:e] + ("…" if e < len(t) else "")
+        h = width // 2
+        parts = []
+        for sp in sorted([a, b]):
+            s = max(0, sp[0] - h // 3)
+            parts.append(t[s:min(len(t), s + h)])
+        return "…" + " … ".join(parts) + "…"
+    s = max(0, mains[0][0] - width // 3)
+    e = min(len(t), s + width)
+    return ("…" if s else "") + t[s:e] + ("…" if e < len(t) else "")
+
+
+def _labels(text: str, rxs: list) -> list:
+    lab = []
+    if CITE_RE.search(text):
+        lab.append("[引]")
+    for rx in rxs:
+        for m in rx.finditer(text):
+            before = text[max(0, m.start() - 12):m.start()]
+            if NEG_ZH_RE.search(before) or NEG_EN_RE.search(before):
+                lab.append("[否]")
+                break
+        if "[否]" in lab:
+            break
+    return lab
+
+
+def _units_for_scope(blocks: list, scope: str, group_of) -> list:
+    """Group blocks into the units within which --and / --not apply ('section' groups by group_of)."""
+    if scope == "para":
+        return [[b] for b in blocks]
+    if scope == "paper":
+        return [blocks] if blocks else []
+    groups = defaultdict(list)
+    for b in blocks:
+        groups[group_of(b[0])].append(b)
+    return list(groups.values())
+
+
+def find_in_paper(name: str, folder: str, a, rx, ands: list, nots: list) -> dict:
+    res = {"paper": name, "zh": [], "src": [], "cards": [], "n": {"zh": 0, "src": 0, "cards": 0}, "problems": []}
+    allrx = [rx] + ands
+
+    def qualifies(text):
+        return rx.search(text) and all(r.search(text) for r in ands) and not any(r.search(text) for r in nots)
+
+    def collect(units, mk):
+        hits = []
+        for u in units:
+            if qualifies(" ".join(t for _, t in u)):
+                hits += [mk(i, t) for i, t in u if rx.search(t)]
+        return hits
+
+    doc = load_translation(folder)
+    if doc and doc["fatal"] and ("zh" in a.sources or "cards" in a.sources):
+        res["problems"].append("译稿无法读取（不是 UTF-8）")
+        doc = None
+    if doc is None and ("zh" in a.sources or "cards" in a.sources) and not res["problems"]:
+        res["problems"].append("没有译稿")
+    if doc and "zh" in a.sources:
+        lines, off = doc["lines"], doc["off"]
+        mb = md_blocks(lines)
+        heads = [(s, len(m.group(1)), m.group(2)) for s, e, k in mb if k == "heading" for m in [HEAD_RE.match(lines[s])]]
+        ref_i = next((i for i, lv, t in heads if lv <= 3 and REF_TITLE_RE.search(t)), None)
+        stop = ref_i if (ref_i is not None and not a.refs) else len(lines)
+        lp = line_pages(lines, mb)
+
+        def sect_of(i):
+            h = [x for x in heads if x[0] <= i]
+            return h[-1][0] if h else -1
+
+        def role_of(i):
+            chain = []
+            for hi, lv, t in reversed([x for x in heads if x[0] <= i]):
+                if not chain or lv < chain[-1][0]:
+                    chain.append((lv, t))
+            for _, t in chain:
+                for role, r in ROLE_RES:
+                    if r.search(t):
+                        return role
+            return ""
+
+        # searchable: paragraphs (soft-wrapped lines joined), list items, quotes, tables; captions are paragraphs
+        blocks = [(s, " ".join(lines[x].strip() for x in range(s, e))) for s, e, k in mb
+                  if s < stop and k in ("para", "item", "quote", "table")]
+
+        def mk(i, t):
+            role = role_of(i)
+            lab = _labels(t, allrx)
+            score = ROLE_WEIGHT.get(role, 1) - 2 * ("[引]" in lab) - 2 * ("[否]" in lab)
+            return {"line": i + off, "page": lp[i], "role": role, "labels": lab, "score": score,
+                    "text": _snippet(t, rx, a.width, ands)}
+        res["zh"] = collect(_units_for_scope(blocks, a.scope, sect_of), mk)
+    if "src" in a.sources:
+        sp = source_path(folder)
+        if not sp:
+            res["problems"].append("没有原文 source.txt")
+        else:
+            slines = open(sp, encoding="utf-8", errors="replace").read().replace("\r\n", "\n").split("\n")
+            sblocks, spage = _src_blocks(slines)
+            rk = running_keys((spage[i], t) for i, t, _ in sblocks)  # journal lines, URLs, 'Page 3 of 9'
+            sblocks = [b for b in sblocks if not is_running(b[1], rk)]
+            if not a.refs:  # stop at the last reference-list heading of the source, if recognisable
+                cuts = [i for i, _, f in sblocks if re.fullmatch(r"(?:\d+\.?\s*)?(references?|bibliography|参考文献)\s*:?", f, re.I)]
+                if cuts:
+                    sblocks = [b for b in sblocks if b[0] < cuts[-1]]
+            blocks = [(i, t) for i, t, _ in sblocks]
+
+            def mk2(i, t):
+                lab = _labels(t, allrx)
+                return {"line": i + 1, "page": spage[i], "role": "", "labels": lab,
+                        "score": 1 - 2 * ("[引]" in lab) - 2 * ("[否]" in lab), "text": _snippet(t, rx, a.width, ands)}
+            # the source has no reliable section headings: 'section' scope means the same page there
+            res["src"] = collect(_units_for_scope(blocks, a.scope, lambda i: spage[i]), mk2)
+    if doc and "cards" in a.sources and doc["fields"]:
+        units = []
+        for k, v in doc["fields"].items():
+            entries = [e.strip() for e in ENTRY_SPLIT_RE.split(str(v)) if e.strip()] or [str(v)]
+            if a.scope == "para":
+                units += [[(k, e)] for e in entries]  # numbered entries are matched one by one
+            else:
+                units.append([(k, e) for e in entries])  # section = the whole field
+        if a.scope == "paper":
+            units = [[x for u in units for x in u]]
+        res["cards"] = [{"field": k, "labels": [], "score": 2, "text": _snippet(f"{k}: {e}", rx, a.width, ands)}
+                        for u in units if qualifies(" ".join(e for _, e in u)) for k, e in u if rx.search(e)]
+    for s in ("zh", "src", "cards"):
+        res["n"][s] = len(res[s])
+    return res
+
+
+def find_glossary(root: str) -> str | None:
+    """_glossary.md in the library root (or up to three folders above it)."""
+    d = os.path.abspath(root)
+    for _ in range(4):
+        p = os.path.join(d, "_glossary.md")
+        if os.path.isfile(p):
+            return p
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return None
+
+
+def glossary_groups(path: str) -> list:
+    """Term groups from _glossary.md: each line / table row `original | translation` is one group; a cell may hold
+    variants (a / b、c) and parenthesised forms (骨髓炎（osteomyelitis）) – all become members of the group."""
+    groups = []
+    for ln in open(path, encoding="utf-8", errors="replace").read().splitlines():
+        if "|" not in ln or re.fullmatch(r"\s*\|?[\s:\-|]+\|?\s*", ln):
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|") if c.strip()]
+        if len(cells) < 2 or any(re.fullmatch(r"(英文|原文|中文|译名|统一中文.*|english|original|term|translation)", c, re.I)
+                                 for c in cells[:2]):
+            continue
+        terms = set()
+        for c in cells[:2]:
+            for part in re.split(r"\s*[/、;；]\s*", c):
+                inner = re.findall(r"[（(]([^）)]+)[）)]", part)
+                main = re.sub(r"[（(][^）)]*[）)]", "", part).strip(" *`")
+                for t in [main] + [x.strip(" *`") for i in inner for x in re.split(r"[,，]", i)]:
+                    if len(t) >= 2 and not t.isdigit():
+                        terms.add(t)
+        if len(terms) >= 2:
+            groups.append(terms)
+    return groups
+
+
+def expand_with_glossary(pattern: str, groups: list, flags: int) -> tuple:
+    """Add the glossary counterparts of every plain alternative in pattern (颅骨 → calvaria, skull …).
+    Only plain alternatives are expanded (no regex syntax inside); returns (new_pattern, added_terms)."""
+    alts = pattern.split("|")
+    if not groups or any(re.search(r"[\\()\[\]{}*+?^$.]", x) for x in alts):
+        return pattern, []
+    rx = re.compile(pattern, flags)
+    added = []
+    for a in (x.strip() for x in alts if x.strip()):
+        al = a.lower()
+        for g in groups:
+            # equal, or the term starts with the word typed (Latin stem of 5+ letters, CJK word of 2+ characters)
+            stem = re.fullmatch(r"[A-Za-z\-]{5,}", a) or re.fullmatch(f"[{CJK}]{{2,}}", a)
+            hit = any(t.lower() == al or (stem and t.lower().startswith(al)) for t in g)
+            if not hit:
+                continue
+            for t in sorted(g):
+                if not rx.search(t) and t not in added:
+                    added.append(t)
+    if not added:
+        return pattern, []
+    return pattern + "|" + "|".join(re.escape(t) for t in added), added
+
+
+def cmd_find(a) -> int:
+    if not os.path.isdir(a.root):
+        die(f"不是文件夹：{a.root}")
+    flags = 0 if a.case else re.I
+    try:
+        re.compile(a.pattern, flags)
+        for p in a.and_ + a.not_:
+            re.compile(p, flags)
+    except re.error as exc:
+        die(f"检索式不是合法的正则表达式：{exc}")
+    expanded, orig_pat, orig_ands = [], a.pattern, list(a.and_)
+    gl = None if a.no_expand else find_glossary(a.root)
+    if gl:
+        groups = glossary_groups(gl)
+        a.pattern, add = expand_with_glossary(a.pattern, groups, flags)
+        expanded += add
+        new_ands = []
+        for p in a.and_:
+            p2, add = expand_with_glossary(p, groups, flags)
+            new_ands.append(p2)
+            expanded += add
+        a.and_ = new_ands
+    rx = re.compile(a.pattern, flags)
+    ands = [re.compile(p, flags) for p in a.and_]
+    nots = [re.compile(p, flags) for p in a.not_]
+    if a.brief:
+        a.per_paper, a.width = 1, min(a.width, 60)
+    a.sources = {s.strip() for s in a.in_.split(",") if s.strip()}
+    bad = a.sources - {"zh", "src", "cards"}
+    if bad or not a.sources:
+        die(f"--in 只能是 zh、src、cards 的组合（逗号分隔），收到：{a.in_}")
+    papers = list(iter_papers(a.root))
+    if not papers:
+        die("没找到文献文件夹", 1)
+    results = [find_in_paper(n, f, a, rx, ands, nots) for n, f in papers]
+    hit = [r for r in results if any(r["n"].values())]
+    miss = [r["paper"] for r in results if not any(r["n"].values())]
+    incomplete = {r["paper"]: r["problems"] for r in results if r["problems"]}
+    scope_txt = {"para": "同一段", "section": "同一节（原文按同一页）", "paper": "同一篇"}[a.scope]
+    desc = f"检索：{orig_pat}" + "".join(f"  且 {p}" for p in orig_ands) + "".join(f"  非 {p}" for p in a.not_)
+    desc += f"  ·范围：{scope_txt}  ·来源：{','.join(sorted(a.sources))}"
+    if a.json:
+        print(json.dumps({"query": desc, "expanded": expanded, "hit": hit, "miss": miss, "total": len(results),
+                          "incomplete": incomplete},
+                         ensure_ascii=False, indent=1))
+        return 0
+    print(desc)
+    if expanded:
+        print(f"术语表扩展（{os.path.basename(gl)}，--no-expand 关闭）：+" + " +".join(expanded[:20])
+              + (" …" if len(expanded) > 20 else ""))
+
+    def report_incomplete():
+        if incomplete:
+            print(f"未完整检索 {len(incomplete)} 篇（结论不能覆盖这些篇）："
+                  + "；".join(f"{k}：{'、'.join(v)}" for k, v in list(incomplete.items())[:20]))
+
+    if not hit:
+        print(f"NO MATCH（本库 {len(results)} 篇中都没有命中；换同义词、英文词干或缩写再试）")
+        report_incomplete()
+        return 0
+    for r in hit:
+        allh = r["zh"] + r["src"] + r["cards"]
+        r["best"] = max(h["score"] for h in allh)
+    hit.sort(key=lambda r: (-r["best"], -sum(r["n"].values()), r["paper"]))
+    for r in hit:
+        cnt = " · ".join(f"{ {'zh': '译文', 'src': '原文', 'cards': '卡片'}[s] } {r['n'][s]}" for s in ("zh", "src", "cards")
+                         if s in a.sources)
+        show = sorted(r["zh"], key=lambda h: (-h["score"], h["line"]))[:a.per_paper]
+        if not show:
+            show = sorted(r["src"], key=lambda h: (-h["score"], h["line"]))[:a.per_paper]
+            pre = "src "
+        else:
+            pre = ""
+        show = show or r["cards"][:a.per_paper]
+        rows = []
+        for h in show:
+            if "field" in h:
+                rows.append(f"卡片  {h['text']}")
+                continue
+            pg = f" p{h['page']}" if h.get("page") else ""
+            tag = " ".join(x for x in [h["role"]] + h["labels"] if x)
+            rows.append(f"{pre}L{h['line']}{pg}{' ' + tag if tag else ''}  {h['text']}")
+        if a.brief:  # one line per paper: the cheap first pass for "which papers…" questions
+            print(f"== {r['paper']}  {cnt} | {rows[0] if rows else ''}")
+            continue
+        print(f"\n== {r['paper']}  {cnt}")
+        for row in rows:
+            print(f"   {row}")
+    print(f"\n命中 {len(hit)} 篇 / 未命中 {len(miss)} 篇（共 {len(results)} 篇）")
+    if miss:
+        print("未命中：" + ("、".join(miss) if len(miss) <= 40 else f"{len(miss)} 篇（--json 可看全部）"))
+    if {"zh", "src"} <= a.sources:
+        only_src = [r["paper"] for r in hit if r["n"]["src"] and not r["n"]["zh"]]
+        only_zh = [r["paper"] for r in hit if r["n"]["zh"] and not r["n"]["src"]]
+        if only_src:
+            print("仅原文命中（译名可能不同，或译文漏了这句）：" + "、".join(only_src))
+        if only_zh:
+            print("仅译文命中（原文用词不同，可补英文同义词再查）：" + "、".join(only_zh))
+    report_incomplete()
+    print("标签：[引] 段内有引用标记，可能在转述别人的工作；[否] 命中词前有否定词。按标签排序，未做过滤。")
     return 0
 
 
@@ -1393,8 +3420,46 @@ def main(argv=None) -> int:
     p.add_argument("path", help="文献文件夹、译稿文件或工作区根目录")
     p.add_argument("--cap-chars", type=int, default=0, help="每条图表注最多保留的字符数（0 = 全文）")
     p.add_argument("--no-conclusion", action="store_true")
+    p.add_argument("--toc-only", action="store_true", help="只输出卡片信息和目录（约 500 token）")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_brief)
+
+    p = sub.add_parser("anchor", help="按原文复核页码锚点：证据确凿才改；没有锚点时整篇自动插入")
+    p.add_argument("path", help="文献文件夹或工作区根目录")
+    p.add_argument("--dry-run", action="store_true", help="只报告，不改文件")
+    p.add_argument("--auto", action="store_true", help="不参考已有锚点，整篇按原文重新推定")
+    p.add_argument("--show", type=int, default=12, help="每篇最多列出多少条改动")
+    p.set_defaults(fn=cmd_anchor)
+
+    p = sub.add_parser("find", help="全库检索：译文 + 原文 + 卡片，按篇聚合")
+    p.add_argument("root", help="工作区根目录（或单篇文件夹）")
+    p.add_argument("pattern", help="正则，忽略大小写；中英文和缩写都写上，如 \"颅骨|calvari|skull\"")
+    p.add_argument("--and", dest="and_", action="append", default=[], help="同一范围内还必须命中（可多次）")
+    p.add_argument("--not", dest="not_", action="append", default=[], help="同一范围内不能出现（可多次）")
+    p.add_argument("--scope", choices=["para", "section", "paper"], default="para", help="--and/--not 的作用范围（默认同一段）")
+    p.add_argument("--in", dest="in_", default="zh,src", help="来源：zh（译文）、src（原文）、cards（卡片字段），逗号分隔")
+    p.add_argument("--per-paper", type=int, default=2, help="每篇显示几条片段")
+    p.add_argument("--brief", action="store_true", help="每篇一行（计数 + 最相关的一条短片段），查全类问题先用它")
+    p.add_argument("--no-expand", action="store_true", help="不按工作区 _glossary.md 自动补同义词")
+    p.add_argument("--width", type=int, default=80, help="片段字数")
+    p.add_argument("--refs", action="store_true", help="也查参考文献列表")
+    p.add_argument("--case", action="store_true", help="区分大小写")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_find)
+
+    p = sub.add_parser("wrap", help="把超过 1500 字的行在句末折开（只加换行，不改字；改前备份）")
+    p.add_argument("path", help="文献文件夹或工作区根目录")
+    p.add_argument("--dry-run", action="store_true", help="只报告，不改文件")
+    p.set_defaults(fn=cmd_wrap)
+
+    p = sub.add_parser("pair", help="原文页与译文页并排输出，供抽检或核对某条 WARN")
+    p.add_argument("path", help="文献文件夹（--sample 时也可以是工作区根目录）")
+    p.add_argument("--page", type=int, help="原文页码")
+    p.add_argument("--line", type=int, help="译稿行号（check 报的 L 号），自动定位到它所在的页")
+    p.add_argument("--sample", type=int, help="每篇随机抽 K 页正文（不含参考文献页），同一篇每次抽到同样的页")
+    p.add_argument("--seed", type=int, help="换一批抽样页")
+    p.add_argument("--max-chars", type=int, default=9000, help="原文、译文各最多输出多少字（默认 9000）")
+    p.set_defaults(fn=cmd_pair)
 
     p = sub.add_parser("check", help="校验译稿")
     p.add_argument("path"); budget(p)
@@ -1402,11 +3467,24 @@ def main(argv=None) -> int:
     p.add_argument("--strict", action="store_true", help="WARN 也算不通过")
     p.add_argument("-q", "--quiet", action="store_true", help="只显示有问题的文献")
     p.add_argument("--log", help="报告另存到此文件")
+    p.add_argument("--json", action="store_true", help="结构化输出：每篇的 FAIL/WARN（message + details）和总计数")
     p.set_defaults(fn=cmd_check)
 
-    p = sub.add_parser("cards", help="汇总 cards.jsonl")
+    p = sub.add_parser("cards", help="汇总 cards.jsonl；--list 只打印紧凑表")
     p.add_argument("root"); p.add_argument("--md", action="store_true"); p.add_argument("--out")
+    p.add_argument("--list", action="store_true", help="每篇一行打印（文件夹 | 年 | 类型 | 一句话），不写文件")
+    p.add_argument("--with", dest="with_", help="--list 时附带的字段，逗号分隔，如 in_vivo,key_result")
     p.set_defaults(fn=cmd_cards)
+
+    p = sub.add_parser("refresh", help="按 manifest.json 记录的 PDF 重新提取旧版本生成的 _work（不碰译稿和图片）")
+    p.add_argument("root", help="文献文件夹或工作区根目录")
+    p.add_argument("--dry-run", action="store_true", help="只列出会重提哪些篇")
+    p.add_argument("--pdf-dir", help="PDF 搬过家时，按文件名到这个文件夹里找")
+    p.add_argument("--force", action="store_true", help="已是当前版本提取的也重提")
+    p.set_defaults(fn=cmd_refresh)
+
+    p = sub.add_parser("selftest", help="运行随包的回归测试（合成样本，不读写你的文件）；升级后跑一次")
+    p.set_defaults(fn=cmd_selftest)
 
     a = ap.parse_args(argv)
     return a.fn(a)

@@ -21,7 +21,8 @@ import zipfile
 
 NAME = "pdf-paper-translation"
 HERE = os.path.dirname(os.path.abspath(__file__))
-PAYLOAD = ["SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "requirements.txt", "install.py", "scripts", "references"]
+PAYLOAD = ["SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "requirements.txt", "install.py", "scripts", "references",
+           "tests"]
 PRESETS = {"claude": os.path.join("~", ".claude", "skills", NAME), "dsh": os.path.join("~", ".dsh", "skills", NAME)}
 
 
