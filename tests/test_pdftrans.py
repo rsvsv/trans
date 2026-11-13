@@ -5,6 +5,7 @@ Covers the defects found by independent reviews, the end-to-end translation run 
 import importlib.util
 import io
 import itertools
+import json
 import os
 import random
 import re
@@ -14,7 +15,10 @@ import tempfile
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "..", "scripts", "pdftrans.py")
+_ARGS = [x for x in sys.argv[1:] if not x.startswith("-")]  # the only argument is the script path (options ignored)
+SCRIPT = os.path.abspath(_ARGS[0]) if _ARGS else os.path.join(HERE, "..", "scripts", "pdftrans.py")
+if not os.path.isfile(SCRIPT):
+    sys.exit(f"pdftrans.py not found: {SCRIPT}  (usage: python test_pdftrans.py [path/to/pdftrans.py])")
 spec = importlib.util.spec_from_file_location("pdftrans", SCRIPT)
 pt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pt)
@@ -58,8 +62,16 @@ def section(out, key):
     return ""
 
 
+def with_captions(d, caps, pages, figs):
+    """Empty figure files plus a manifest with the original captions, as extract would leave them."""
+    os.makedirs(os.path.join(d, "figures"))
+    for n in figs:
+        open(os.path.join(d, "figures", n + ".png"), "wb").write(b"")
+    json.dump({"pages": pages, "captions": caps}, open(os.path.join(d, "_work", "manifest.json"), "w"))
+
+
 def strip_anchors(t):
-    t = re.sub(r"<!--\s*p\d+\s*-->", "", t)
+    t = pt.ANCHOR_RE.sub("", t)
     t = re.sub(r'(?m)^anchors: ".*"\n', "", t)
     return [ln for ln in t.split("\n") if ln.strip()]
 
@@ -255,7 +267,6 @@ def t_number_context(tmp):
 
 def t_captions(tmp):
     print("v3.1: captions compared with the original captions")
-    import json
     src = ["Text. Figure 1. SEM images of scaffold A with pore size 12.5 μm and porosity 81.3%. Data are 3.14 ± 0.2.",
            "Figure 2. Release profile of drug B at pH 5.5 and 7.4 showing 45.6% and 67.8% release with 1.23 ± 0.04."]
     caps = [{"page": 1, "kind": "fig", "num": "1", "text": src[0][6:]},
@@ -266,10 +277,7 @@ def t_captions(tmp):
             "![图 2](figures/fig02.png)\n\n**图 2** 药物 B 在 pH 5.5 与 7.4 下的释放曲线，释放 45.6% 与 67.8%，1.23 ± 0.04。\n\n"
             "**补充文件 1：图 S1** 额外数据 9.87。\n")
     d, f = paper(tmp, "caps", body, src)
-    os.makedirs(os.path.join(d, "figures"))
-    for n in ("fig01", "fig02"):
-        open(os.path.join(d, "figures", n + ".png"), "wb").write(b"")
-    json.dump({"pages": 2, "captions": caps}, open(os.path.join(d, "_work", "manifest.json"), "w"))
+    with_captions(d, caps, 2, ("fig01", "fig02"))
     code, out = run("check", d)
     ok(re.search(r"图 1 L\d+ \[标尺\] 「50 μm」", section(out, "原图注没有的数字")) is not None, "scale bar added to caption 1 reported")
     ok(re.search(r"漏译半句.*图 1 L\d+：81\.3", out) is not None, "81.3 missing from caption 1 reported")
@@ -353,7 +361,6 @@ def t_number_details(tmp):
     ok(re.search(r"L\d+ 「104」 .*稀释 104 倍", sec) is not None, "104 listed with its context")
     ok(re.search(r"L\d+ 「56.78」", sec) is not None, "56.78 listed")
     code, js = run("check", d, "--json")
-    import json
     data = json.loads(js[js.index("{"):])
     w = data["papers"][0]["warn"]
     ok(data["total"]["warn"] == len(w) and any(x["details"] for x in w), "--json: counts match, details separate")
@@ -479,7 +486,6 @@ def t_extract_smoke(tmp):
     ok(txt.count("<<<PAGE") == 4 and "32.75" in txt, "4 pages, numbers kept")
     ok(len(pt.running_keys(pt.page_paras(pt.source_pages(out_dir)))) >= 1, "running header recognised in the extracted text")
     # refresh: an old _work is re-extracted from the recorded PDF; the translation is not touched
-    import json
     man = os.path.join(out_dir, "_work", "manifest.json")
     m = json.load(open(man, encoding="utf-8"))
     m["tool"], m["figures"] = "pdftrans 2.0", [{"name": "fig01", "page": 1, "method": "manual"}]
@@ -502,6 +508,70 @@ def t_extract_smoke(tmp):
     ok("[拒绝]" in out, "a different page count is refused")
 
 
+def t_code_review_fixes(tmp):
+    print("v3.2: code review findings (refresh errors, number forms, running lines, wrap, unit kinds)")
+    # refresh: a PDF that cannot be extracted is reported, the next paper is still processed, exit code 1
+    for name in ("a_bad", "b_bad"):
+        d = os.path.join(tmp, "lib", name)
+        os.makedirs(os.path.join(d, "_work"))
+        bad = os.path.join(d, "broken.pdf")
+        open(bad, "wb").write(b"not a pdf")
+        json.dump({"pdf": bad, "pages": 1, "tool": "pdftrans 2.0"}, open(os.path.join(d, "_work", "manifest.json"), "w"))
+        open(os.path.join(d, "_work", "source.txt"), "w", encoding="utf-8").write("<<<PAGE 1>>>\nkept\n")
+    code, out = run("refresh", os.path.join(tmp, "lib"))
+    ok(code == 1 and out.count("[失败]") == 2 and "失败 2 篇" in out, f"both broken PDFs reported, batch finished (rc={code})")
+    ok(open(os.path.join(tmp, "lib", "a_bad", "_work", "source.txt"), encoding="utf-8").read().endswith("kept\n"),
+       "source.txt of a failed paper untouched")
+    # number forms that must not vouch for a wrong translation
+    ok(("2", "g") not in pt.src_num_context(pt.augment_source("Two gram-variable isolates were tested."))[0],
+       "'Two gram-variable' does not become 2 g")
+    ok("4-μm-thick" in pt.augment_source("Four-micrometer-thick sections."), "'Four-micrometer-thick' still 4-μm")
+    for s_, want in (("5- micron-thick slices", "5- μm-thick"), ("5 micron-thick slices", "5 μm-thick"),
+                     ("two hour-long sessions", "2 h-long")):
+        ok(want in pt.augment_source(s_), f"'{s_}' becomes '{want}'")
+    ok("10 g" not in pt.augment_source("Ten Gram-positive and 5 Gram-negative strains."), "Gram-positive/negative stay")
+    aug = pt.augment_source("as reported [1,2] and in refs 3,4. Coated with 0,1 mg fibronectin.")
+    nums = set(pt.NUMCHK_RE.findall(pt.norm_digits(aug)))
+    ok("0.1" in nums and not {"1.2", "3.4"} & nums, f"decimal comma only before a unit (got {sorted(nums)})")
+    pairs = pt.NUM_UNIT_RE.findall(pt.norm_units("a 10−3 mM solution, 1 × 10−3 mg, 10-30 mM, 5 mg"))
+    ok(("3", "mM") not in pairs and ("3", "mg") not in pairs and ("30", "mM") in pairs and ("5", "mg") in pairs,
+       f"10−3 is an exponent, 10-30 a range (got {pairs})")
+    # v3.2.1: in the source a hyphenated modifier before a number does not hide it
+    t = pt.norm_units(pt.augment_source("Scale bar: top-2 mm, bottom-500 μm."))
+    got = {(a, m.group(2)) for m in pt.NUM_LIST_UNIT_RE.finditer(t) for a in re.findall(pt._NUM, m.group(1))}
+    ok({("2", "mm"), ("500", "μm")} <= got, f"source 'top-2 mm, bottom-500 μm' keeps both (got {got})")
+    ok(("5", "%") in pt.src_num_context(pt.augment_source("Glass: 80% SiO2-15% CaO-5% P2O5."))[0],
+       "source 'CaO-5% P2O5' keeps 5 %")
+    srcs = ["Text. Figure 1. Histology of the defect. Scale bars: top-2 mm, bottom-500 μm."]
+    bods = ("# T\n\n<!-- p1 -->\n\n## 结果\n\n正文。\n\n![图 1](figures/fig01.png)\n\n"
+            "**图 1** 缺损的组织学图像。标尺：上 2 mm，下 500 μm。\n")
+    ds, _ = paper(tmp, "hyphenscale", bods, srcs)
+    with_captions(ds, [{"page": 1, "kind": "fig", "num": "1", "text": srcs[0][6:]}], 1, ("fig01",))
+    code, out = run("check", ds)
+    ok("原图注没有的数字" not in out, "scale bars written 'top-2 mm' in the original caption are not reported")
+    # running lines: a plain footer with no digits on every other page is still one
+    pages = [(i, f"Body text number {i} " * 20 + ("\n\nPaper RSC Advances" if i % 2 == 0 else "")) for i in range(1, 11)]
+    ok(pt.running_keys(pt.page_paras(pages)) == {"paper rsc advances"}, "digit-free footer on 5 of 10 pages found")
+    pages = [(i, f"Body text number {i} " * 20 + ("\n\nDay 7 group A" if i % 2 == 0 else "")) for i in range(1, 11)]
+    ok(not pt.running_keys(pt.page_paras(pages)), "label with a fixed number on 5 of 10 pages is content")
+    # running lines: a label repeated with the same digits on 3 of 5 pages is content
+    pages = [(i, f"Body text number {i} " * 20 + ("\n\nDay 7 group A" if i <= 3 else "")) for i in range(1, 6)]
+    ok(not pt.running_keys(pt.page_paras(pages)), "repeated figure label is not a running line")
+    pages = [(i, f"Body text {i} " * 20 + f"\n\nJ. Things, 2024, 15, {100 + i}") for i in range(1, 6)]
+    ok(len(pt.running_keys(pt.page_paras(pages))) == 1, "journal line with a changing page number still found")
+    # wrap / hard wraps: abbreviations are not sentence ends
+    parts = pt.wrap_line("A" * 1000 + " as shown by Wang et al. (2020) the data. Next " + "B" * 600)
+    ok(len(parts) == 2 and parts[0].endswith("the data."), "wrap does not break after 'et al.'")
+    ok(pt.hard_wraps(["如 Wang et al.", "(2020) 所述。"]) == [0], "a line broken after 'et al.' is a hard wrap")
+    # source snippet: mM is a concentration, not a length
+    ss = pt.src_snip("250", {1: "pores of 150–250 mm were made. " + "x " * 40 + "and 250 μM drug"}, 1, "mM")
+    ok("250 μM" in ss and "150–250 mm" not in ss, f"same kind of unit preferred (got {ss})")
+    # wrap lists an unbreakable paragraph over 1500 characters
+    d, f = paper(tmp, "nowrap", "# T\n\n<!-- p1 -->\n\n" + "无句末的长段落" * 230 + "\n", ["Text."])
+    code, out = run("wrap", d, "--dry-run")
+    ok("找不到合适的句末" in out, "1,610-character paragraph without a sentence end is listed")
+
+
 def t_review_fixes(tmp):
     print("v3.2: review findings (missing last page, Gram-positive, scale-bar scope, two _fields tables)")
     fill = "Running text without any numbers that describes the study in plain words for the reader. "
@@ -520,15 +590,11 @@ def t_review_fixes(tmp):
                                           "| 字段 | 说明 | 取值 |\n|---|---|---|\n| animal | 动物 | 大鼠 / 小鼠 |\n")
     ok(pt.parse_field_values(f) == {"animal": ["大鼠", "小鼠"]}, "value column belongs to its own table only")
     ok(dict(pt.parse_fields_file(f))["subject"].endswith("必填"), "first table keeps its third column in the description")
-    import json
     srcc = ["Text. Figure 1. Histology of the defect at week 4 stained with HE."]
     bodyc = ("# T\n\n<!-- p1 -->\n\n## 结果\n\n正文。\n\n![图 1](figures/fig01.png)\n\n"
              "**图 1** 第 4 周缺损的 HE 染色组织学图像。标尺：100 μm；切片厚度为 30 μm。误差棒 bar 表示 25.5 μm。\n")
     dc, _ = paper(tmp, "scalecap", bodyc, srcc)
-    os.makedirs(os.path.join(dc, "figures"))
-    open(os.path.join(dc, "figures", "fig01.png"), "wb").write(b"")
-    json.dump({"pages": 1, "captions": [{"page": 1, "kind": "fig", "num": "1", "text": srcc[0][6:]}]},
-              open(os.path.join(dc, "_work", "manifest.json"), "w"))
+    with_captions(dc, [{"page": 1, "kind": "fig", "num": "1", "text": srcc[0][6:]}], 1, ("fig01",))
     code, out = run("check", dc)
     sec = section(out, "原图注没有的数字")
     ok("[标尺] 「100 μm」" in sec, "100 μm after 标尺 tagged")
@@ -542,7 +608,7 @@ def main():
                   t_duplicates_and_meta, t_bom_crlf, t_fields, t_find_misc, t_coverage_table,
                   t_number_context, t_captions, t_glossary_brief,
                   t_running, t_number_forms, t_number_details, t_continued_page, t_key_result_hint, t_pair,
-                  t_field_values, t_wrap, t_extract_smoke, t_review_fixes):
+                  t_field_values, t_wrap, t_extract_smoke, t_review_fixes, t_code_review_fixes):
             sub = os.path.join(tmp, t.__name__)
             os.makedirs(sub)
             try:

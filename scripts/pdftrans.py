@@ -35,7 +35,7 @@ import shutil
 import sys
 from collections import Counter, defaultdict
 
-VERSION = "3.2"
+VERSION = "3.2.1"
 WORK = "_work"
 MAX_PX = int(os.environ.get("PDFTRANS_MAX_PX") or 1_150_000)
 MAX_SIDE = int(os.environ.get("PDFTRANS_MAX_SIDE") or 1568)
@@ -82,6 +82,15 @@ def work_dir(outdir: str) -> str:
     d = os.path.join(outdir, WORK)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def backup_once(folder: str, path: str, bak_name: str) -> None:
+    """Copy path to _work/backup/bak_name unless that backup already exists (the first pre-edit copy is kept)."""
+    bdir = os.path.join(work_dir(folder), "backup")
+    os.makedirs(bdir, exist_ok=True)
+    bak = os.path.join(bdir, bak_name)
+    if os.path.isfile(path) and not os.path.exists(bak):
+        shutil.copyfile(path, bak)
 
 
 def load_manifest(outdir: str) -> dict:
@@ -945,6 +954,9 @@ LATIN_RUN_RE = re.compile(r"(?:[A-Za-z][A-Za-z'’\-]*[ ,;:]+){10,}[A-Za-z]")
 PLACEHOLDER_RE = re.compile(r"<!--\s*CONT\s*-->|\bTODO\b|\bFIXME\b|待译|待补|未完待续|\[\[TBD\]\]")
 SPECIAL_START = ("#", ">", "|", "```", "<", "![", "---", "$$")
 LIST_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
+# a period after these is not the end of a sentence (Wang et al. (2020), Fig. 3, e.g. the)
+ABBREV_END_RE = re.compile(r"(?:\bet al|\b(?:figs?|eqs?|refs?|nos?|vs|approx|ca|cf|resp|e\.g|i\.e|dr|prof|inc|ltd|co|corp"
+                           r"|suppl|vol|pp?))\.$", re.I)
 TERMINAL_RE = re.compile(r"[。！？…!?：:；;）)」』】》”\"*`_\]$|.]$")  # no commas: a line ending in ，/,/、 is mid-sentence
 # a caption line: bold label + number in any language, or a known unnumbered kind (graphical abstract, TOC)
 CAPSTART_RE = re.compile(r"^\s*\*\*\s*(?:图文摘要|graphical abstract|toc\b|table of contents)", re.IGNORECASE)
@@ -992,7 +1004,7 @@ def hard_wraps(lines: list[str]) -> list[int]:
             continue
         a, b = lines[i], lines[i + 1]
         if is_plain(a) and b.strip() and not b.strip().startswith(SPECIAL_START) and not LIST_RE.match(b) \
-                and not TERMINAL_RE.search(a.rstrip()):
+                and not (TERMINAL_RE.search(a.rstrip()) and not ABBREV_END_RE.search(a.rstrip())):
             bad.append(i)
     return bad
 
@@ -1243,9 +1255,15 @@ def iter_papers(path: str):
             yield name, p
 
 
+def _json_item(m: str) -> dict:
+    head, *rest = m.split(DETAIL_INDENT)
+    return {"message": head, "details": rest}
+
+
 def cmd_check(a) -> int:
     if not os.path.isdir(a.path):
         die(f"不是文件夹：{a.path}")
+    as_json = getattr(a, "json", False)
     tot = {"papers": 0, "fail": 0, "warn": 0, "bad": 0}
     lines, jpapers = [], []
     for name, folder in iter_papers(a.path):
@@ -1257,12 +1275,9 @@ def cmd_check(a) -> int:
         tot["warn"] += len(w)
         tot["bad"] += bool(f)
         st = "FAIL" if f else ("WARN" if w else "OK")
-        if getattr(a, "json", False):
-            def item(m):
-                head, *rest = m.split(DETAIL_INDENT)
-                return {"message": head, "details": rest}
+        if as_json:
             jpapers.append({"paper": name, "file": md, "status": st, **info,
-                            "fail": [item(m) for m in f], "warn": [item(m) for m in w]})
+                            "fail": [_json_item(m) for m in f], "warn": [_json_item(m) for m in w]})
             continue
         if a.quiet and st == "OK":
             continue
@@ -1270,17 +1285,12 @@ def cmd_check(a) -> int:
         lines += [f"    FAIL  {m}" for m in f] + [f"    WARN  {m}" for m in w]
     if not tot["papers"]:
         die("没找到文献文件夹（含 *.<lang>.md 译稿或 _work/ 的子文件夹）", 1)
-    if getattr(a, "json", False):
-        passed = tot["fail"] == 0 and (not a.strict or tot["warn"] == 0)
-        report = json.dumps({"papers": jpapers, "total": tot, "passed": passed}, ensure_ascii=False, indent=1)
-        if a.log:
-            with open(a.log, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(report + "\n")
-        print(report)
-        return 0 if passed else 1
-    summary = f"共 {tot['papers']} 篇 · FAIL {tot['fail']} 条（{tot['bad']} 篇）· WARN {tot['warn']} 条"
     passed = tot["fail"] == 0 and (not a.strict or tot["warn"] == 0)
-    report = "\n".join(lines) + f"\n\n{summary}\n结果：{'通过' if passed else '未通过'}"
+    if as_json:
+        report = json.dumps({"papers": jpapers, "total": tot, "passed": passed}, ensure_ascii=False, indent=1)
+    else:
+        summary = f"共 {tot['papers']} 篇 · FAIL {tot['fail']} 条（{tot['bad']} 篇）· WARN {tot['warn']} 条"
+        report = "\n".join(lines) + f"\n\n{summary}\n结果：{'通过' if passed else '未通过'}"
     if a.log:
         with open(a.log, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(report + "\n")
@@ -1591,10 +1601,11 @@ def _run_key(par: str) -> str:
 def running_keys(paras) -> set:
     """Running headers and footers of a source, from (page, paragraph) pairs: short paragraphs (journal line,
     URL, 'Page 3 of 9', 'Wang et al.') that recur on at least 3 pages and on 30% of all pages once digits are
-    masked (the page number inside them changes). Measured on a 38-paper library: every paper's running lines
+    masked (the page number inside them changes); 70% for a line without a changing number, year, URL or
+    'et al.', so a figure label or table header repeated on a few pages is kept. Measured on a 38-paper library: every paper's running lines
     found, no body paragraph caught; first-page mastheads (not repeated) and reference entries stay.
     source.txt keeps these lines (they carry volume, article number and DOI); find and pair skip them."""
-    seen, pages = defaultdict(set), set()
+    seen, raw, pages = defaultdict(set), defaultdict(set), set()
     for p, t in paras:
         pages.add(p)
         t = t.strip()
@@ -1602,11 +1613,17 @@ def running_keys(paras) -> set:
             k = _run_key(t)
             if len(k) >= 8 or "#" in k:
                 seen[k].add(p)
+                raw[k].add(tuple(re.findall(r"\d+", t)))
     n = len(pages)
 
-    def typical(k):  # page numbers, volume/year, URLs, 'Wang et al.': what running lines are made of
-        return "#" in k or "www" in k or "http" in k or "et al" in k
-    return {k for k, ps in seen.items() if len(ps) >= max(3, (0.3 if typical(k) else 0.5) * n)}
+    def typical(k):  # what running lines are made of: a page number (digits that change from page to page),
+        # a year/volume line, a URL, 'Wang et al.'. A label repeated with the same digits ('Day 7 group A') is not.
+        return (len(raw[k]) > 1 or any(re.fullmatch(r"(?:19|20)\d\d", x) for d in raw[k] for x in d)
+                or "www" in k or "http" in k or "et al" in k)
+    # anything else must be on most pages: hiding a real paragraph from pair/find is worse than a little noise.
+    # A line with no digits at all is a plain footer ('Paper RSC Advances' on every other page): 50% is enough.
+    return {k for k, ps in seen.items()
+            if len(ps) >= max(3, (0.3 if typical(k) else (0.5 if "#" not in k else 0.7)) * n)}
 
 
 def is_running(par: str, keys: set) -> bool:
@@ -1619,19 +1636,14 @@ def page_paras(pages: list):
     return [(p, x) for p, t in pages for x in re.split(r"\n\s*\n", t) if x.strip()]
 
 
-def strip_running(pages: list) -> tuple:
-    """Source pages without their running headers/footers, and how many paragraphs were left out."""
+def strip_running(pages: list) -> list:
+    """Source pages without their running headers/footers."""
     keys = running_keys(page_paras(pages))
-    out, n = [], 0
+    out = []
     for p, t in pages:
-        keep = []
-        for x in re.split(r"\n\s*\n", t):
-            if x.strip() and is_running(x, keys):
-                n += 1
-            elif x.strip():
-                keep.append(x.strip("\n"))
+        keep = [x.strip("\n") for x in re.split(r"\n\s*\n", t) if x.strip() and not is_running(x, keys)]
         out.append((p, "\n\n".join(keep)))
-    return out, n
+    return out
 
 
 FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
@@ -2138,11 +2150,7 @@ def cmd_anchor(a) -> int:
                 print(f"    提示：原稿锚点只覆盖 {n_model}/{len(r['pnos'])} 页，可考虑 --auto 整篇重排")
         if a.dry_run:
             continue
-        bdir = os.path.join(work_dir(folder), "backup")
-        os.makedirs(bdir, exist_ok=True)
-        bak = os.path.join(bdir, re.sub(r"\.md$", "", doc["name"]) + ".before-anchor.md")
-        if not os.path.exists(bak):
-            shutil.copyfile(doc["path"], bak)
+        backup_once(folder, doc["path"], re.sub(r"\.md$", "", doc["name"]) + ".before-anchor.md")
         prefix = doc["text"][:len(doc["text"]) - len(doc["body"])]
         body = "\n".join(place_anchors(lines, units, r["new"], r["pnos"], blocks)) if rewrite else doc["body"]
         write_atomic(doc["path"], set_yaml_field(prefix + body, "anchors", want))
@@ -2159,13 +2167,18 @@ NUMCHK_RE = re.compile(r"(?<![\d.])(\d+\.\d+|\d{3,})(?!\.?\d)")
 POW_LOST_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)?\s*[×xX]\s*10([1-9]\d?)(?![\d.⁰¹²³⁴⁵⁶⁷⁸⁹])"  # 1 × 106, not × 100
                          r"|(?<![\d.A-Za-z])10([1-9])\s*(?:CFU|cfu|copies|cells|个细胞|个菌)")  # 106 CFU for 10⁶ CFU
 PTAG_RE = re.compile(r"\[p(\d+)(?:\s*[-–,，]\s*p?(\d+))?\]")
-LONG_LINE = 2000
+LINE_CUT = 2000  # file readers cut lines at about this length (check warns above it)
 UNIT_PAT = (r"(wt\s?%|%|°C|kDa|MPa|kPa|GPa|Pa|kHz|MHz|Hz|nm|μm|mm|cm|μL|mL|ng|μg|mg|kg|g|nM|μM|mM|mol|"
             r"h|min|CFU|rpm|kV|mV|V|mW|W|J|eV|U|IU)(?![A-Za-z])")
 _NUM = r"\d+(?:\.\d+)?"
-NUM_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])(?<![A-Za-z][\u2212\u207b-])(" + _NUM + r")\s*" + UNIT_PAT)  # not mg L\u22121 min
+# not an exponent: mg L\u22121 min, 10\u22123 mM, 1 \u00d7 10\u22123 mg (a true minus sign; '10-30 mM' with a hyphen is a range)
+_NOT_EXP = r"(?<![A-Za-z][\u2212\u207b-])(?<!\b10[\u2212\u207b])"
+# in the source a list may close on a unit after a hyphenated modifier ('scale bars: top-2 mm, bottom-500 \u03bcm'),
+# so only a true minus sign blocks there: ASCII '-' would hide the number ('CaO-5% P2O5')
+_NOT_EXP_LIST = r"(?<![A-Za-z][\u2212\u207b])(?<!\b10[\u2212\u207b])"
+NUM_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])" + _NOT_EXP + r"(" + _NUM + r")\s*" + UNIT_PAT)
 # in the source a unit may close a list or range: "6 and 24 h", "66.03 and 59.5%", "20 to 50 °C", "12-h", "565/578 nm"
-NUM_LIST_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])(" + _NUM + r"(?:\s*(?:,|，|and|or|to|vs\.?|–|—|-|~|/|、|×)\s*" + _NUM
+NUM_LIST_UNIT_RE = re.compile(r"(?<![\d.A-Za-z])" + _NOT_EXP_LIST + r"(" + _NUM + r"(?:\s*(?:,|，|and|or|to|vs\.?|–|—|-|~|/|、|×)\s*" + _NUM
                               + r")*)\s*[-‐]?\s*" + UNIT_PAT)
 PM_RE = re.compile(r"(?<![\d.])(" + _NUM + r")\s*(?:±|\+/-|\+/−)\s*(" + _NUM + r")(?!\d|\.\d)")
 
@@ -2190,7 +2203,7 @@ UNIT_WORDS = [(r"micrograms?", "\u03bcg"), (r"milligrams?", "mg"), (r"nanograms?
               (r"degrees? (?:Celsius|centigrade)", "\u00b0C"), (r"kilodaltons?", "kDa")]
 _UNIT_WORD_RE = re.compile(r"(?<![\d.A-Za-z])((?:\d+(?:\.\d+)?|[A-Za-z]+(?:-[A-Za-z]+)?)[\s\u2010-]+)("
                            + "|".join(w for w, _ in UNIT_WORDS)
-                           + r")(?![A-Za-z])(?![\u2010-](?:positive|negative|stain|scale))", re.I)
+                           + r")(?![A-Za-z])", re.I)
 _TENS = "twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety"
 _ONES = "one|two|three|four|five|six|seven|eight|nine"
 _NUMWORD_RE = re.compile(r"(?<![A-Za-z])(?:(" + _TENS + r")[\s-]+(" + _ONES + r")|(" + "|".join(NUM_WORDS) + r"))"
@@ -2206,6 +2219,12 @@ def augment_source(src_text: str) -> str:
         lead = m.group(1).strip(" -\u2010").lower()
         if not (re.fullmatch(r"\d+(?:\.\d+)?", lead) or all(x in NUM_WORDS for x in lead.split("-"))):
             return m.group(0)
+        # 'gram-' + word is the Gram stain ('Two gram-variable isolates', 'Ten Gram-positive'), not grams, unless
+        # the number is hyphen-joined to it as well ('five-gram-heavy'); other units keep their hyphenated
+        # adjective ('5 micron-thick', '5- micron-thick', 'two hour-long'). rstrip: the separator may end in a space.
+        if (m.group(2).lower().startswith("gram") and re.match(r"[\u2010-][A-Za-z]", m.string[m.end():])
+                and m.group(1).rstrip()[-1] not in "-\u2010"):
+            return m.group(0)
         return m.group(1) + next(s for w, s in UNIT_WORDS if re.fullmatch(w, m.group(2), re.I))
     t = _UNIT_WORD_RE.sub(unit, src_text)
 
@@ -2214,7 +2233,8 @@ def augment_source(src_text: str) -> str:
             return str(NUM_WORDS[m.group(3).lower()])
         return str(NUM_WORDS[m.group(1).lower()] + NUM_WORDS[m.group(2).lower()])
     t = _NUMWORD_RE.sub(num, t)
-    t = re.sub(r"(?<![\d,.])(\d+),(\d{1,2})(?![\d,])", r"\1.\2", t)
+    # only before a unit or \u00b1 (0,1 mg): '[1,2]' and 'refs 3,4' are lists, not decimals
+    t = re.sub(r"(?<![\d,.])(\d+),(\d{1,2})(?![\d,])(?=\s*(?:\u00b1|[-\u2010]?\s*" + UNIT_PAT + "))", r"\1.\2", t)
     t = re.sub(r"(?<=[A-Za-z])\.(?=\d)", ". ", t)
     t = re.sub(r"(?<=[a-z]{2})(?=" + _NUM + r"\s*[-\u2010]?\s*" + UNIT_PAT + ")", " ", t)  # 'into5 mL' (lost space)
     return src_text if t == src_text else src_text + "\n\n" + t
@@ -2391,18 +2411,31 @@ def line_snip(line: str, val: str, width: int = 70) -> str:
     return ("…" if s else "") + t[s:e] + ("…" if e < len(t) else "")
 
 
+UNIT_KINDS = {"mass": ("ng", "μg", "mg", "kg", "g"), "volume": ("μL", "mL"), "length": ("nm", "μm", "mm", "cm"),
+              "concentration": ("nM", "μM", "mM", "mol"), "time": ("h", "min"), "pressure": ("Pa", "kPa", "MPa", "GPa"),
+              "frequency": ("Hz", "kHz", "MHz"), "voltage": ("V", "mV", "kV"), "power": ("W", "mW"),
+              "percent": ("%", "wt%")}
+_UNIT_KIND = {u: k for k, us in UNIT_KINDS.items() for u in us}
+
+
+def unit_kind(u: str) -> str:
+    """What a unit measures (mg and μg: mass; mM and μM: concentration, not length like mm)."""
+    u = u.replace(" ", "")
+    return _UNIT_KIND.get(u, u)
+
+
 def src_snip(num: str, pages_n: dict, near, unit: str = "", width: int = 56) -> str:
     """Where a bare number occurs in the source: first an occurrence with a unit of the same kind (150\u2013250 mm
     for 250 \u03bcm), then any unit, then none; within each, the translation line's page \u00b11 first. Small
     integers with no unit nearby are not shown (they occur everywhere and would only mislead)."""
     rx = re.compile(r"(?<![\d.])" + re.escape(num) + r"(?!\d|\.\d)")
-    base = unit[-1:].lower() if unit else ""
+    base = unit_kind(unit) if unit else ""
     best = None
     for p, t in pages_n.items():
         for m in rx.finditer(t):
             after = t[m.end():m.end() + 8]
             um = re.match(r"\s*[-\u2010]?\s*" + UNIT_PAT, after)
-            kind = 0 if (um and base and um.group(1)[-1:].lower() == base) else (1 if um else 2)
+            kind = 0 if (um and base and unit_kind(um.group(1)) == base) else (1 if um else 2)
             dist = 0 if near and abs(p - near) <= 1 else 1
             key = (kind, dist, abs(p - (near or p)))
             if best is None or key < best[0]:
@@ -2437,7 +2470,6 @@ def number_issues(lines: list, L0: int, stop: int, src_text: str, skip: set | No
     aug = augment_source(src_text)
     srcnums = set(NUMCHK_RE.findall(norm_digits(aug)))
     spairs, spm = src_num_context(aug)
-    pages_n = {p: norm_units(t) for p, t in (pages or [])}
     skip = skip or set()
     miss, powlost, ctx, in_code = [], [], [], False
     for i, ln in enumerate(lines[:stop]):
@@ -2480,14 +2512,14 @@ def number_issues(lines: list, L0: int, stop: int, src_text: str, skip: set | No
     def page_of(i):
         return lp[i] if lp and i < len(lp) else None
 
-    def rows(items, with_src=False):
+    def rows(items, pages_n=None):
         out, seen = [], set()
         for i, v in items:
             if (i, v) in seen:  # the same value twice on one line: one row
                 continue
             seen.add((i, v))
             r = f"L{i + L0} 「{v}」 {line_snip(lines[i], v)}"
-            if with_src and pages_n:
+            if pages_n and len(out) < DETAIL_MAX:  # only the rows details() shows get a source snippet
                 parts = v.split(" ")
                 ss = src_snip(parts[0], pages_n, page_of(i), parts[1] if len(parts) == 2 else "")
                 if ss:
@@ -2502,7 +2534,7 @@ def number_issues(lines: list, L0: int, stop: int, src_text: str, skip: set | No
         r = rows(miss)
         out.append(("WARN", f"原文中找不到的数字 {len(r)} 处（抄错、换算、从图上读数，或译者自己加的说明？）：" + details(r)))
     if ctx:
-        r = rows(ctx, True)
+        r = rows(ctx, {p: norm_units(t) for p, t in (pages or [])})
         out.append(("WARN", f"数字在原文里有，但这个「数字 + 单位」或「均值 ± SD」组合原文没有 {len(r)} 处"
                             f"（单位抄错、配错组、标尺、从图上读数，或原文提取丢了 μ？对照右侧原文）：" + details(r)))
     return out
@@ -2535,12 +2567,13 @@ def key_result_issues(kr: str, pages: list) -> list:
             out.append(("WARN", f"key_result 第 {k} 条的 {', '.join(lost[:4])} 不在原文 {where}（±1 页）"))
     if untagged:
         sugg = []
+        btok = {p: set(NUM_TOKEN_RE.findall(t)) for p, t in byno.items()}
         for k in untagged:
             seg = segs[int(k) - 1]
             nums = {x for x in NUM_TOKEN_RE.findall(norm_digits(seg)) if "." in x or len(x) >= 3}
             if not nums or not byno:
                 continue
-            have = {p: len(nums & set(NUM_TOKEN_RE.findall(t))) for p, t in byno.items()}
+            have = {p: len(nums & s) for p, s in btok.items()}
             top = max(have.values())
             best = [p for p, c in have.items() if c == top]
             if top and top >= (len(nums) + 1) // 2 and len(best) <= (3 if top >= 2 else 1):
@@ -2660,8 +2693,8 @@ def page_coverage_issues(lines: list, r: dict, pages: list) -> list:
     for s, e, k in r["blocks"]:
         if k == "table" and lp[s] is not None:
             tr[lp[s]] += sum(len(re.sub(r"[\s|:\-]", "", lines[x])) for x in range(s, e))
-    cand = [(p, prose_chars(t)) for p, t in pages]
-    cand = [(p, n) for p, n in cand if n >= 1200 and tr[p] < 0.12 * n]
+    pc = {p: prose_chars(t) for p, t in pages}
+    cand = [(p, n) for p, n in pc.items() if n >= 1200 and tr[p] < 0.12 * n]
     if not cand:
         return []
     # A paragraph that starts on page p-1 and runs across a figure page belongs to p-1 (one block, one page),
@@ -2673,10 +2706,10 @@ def page_coverage_issues(lines: list, r: dict, pages: list) -> list:
     df = Counter(x for s in ptok.values() for x in s)
     utok = [sig_tokens(t) for t in r["texts"]]
     alltr = set().union(*utok) if utok else set()
-    pc = {p: prose_chars(t) for p, t in pages}
     # translation chars per source prose char, from the pages that are not suspect (a missing page must not
     # lower the yardstick it is measured with)
-    okp = [q for q in pc if q not in {c for c, _ in cand} and pc[q] >= 300]
+    suspect = {c for c, _ in cand}
+    okp = [q for q in pc if q not in suspect and pc[q] >= 300]
     ratio = sum(tr[q] for q in okp) / max(1, sum(pc[q] for q in okp)) if len(okp) >= 2 else None
     thin = []
     for p, n in cand:
@@ -2705,9 +2738,9 @@ def page_coverage_issues(lines: list, r: dict, pages: list) -> list:
 
 def v3_checks(folder: str, doc: dict, lines: list, L0: int, ref_i, anchors: list) -> list:
     msgs = []
-    longl = [i + L0 for i, ln in enumerate(lines) if len(ln) > LONG_LINE]
+    longl = [i + L0 for i, ln in enumerate(lines) if len(ln) > LINE_CUT]
     if longl:
-        msgs.append(("WARN", f"超过 {LONG_LINE} 字的行 {len(longl)} 处（读文件工具会截断；在句末换行，不加空行）："
+        msgs.append(("WARN", f"超过 {LINE_CUT} 字的行 {len(longl)} 处（读文件工具会截断；在句末换行，不加空行）："
                              f"行 {', '.join(map(str, longl[:6]))}"))
     pages = source_pages(folder)
     fields = doc["fields"]
@@ -2742,10 +2775,12 @@ def cmd_refresh(a) -> int:
     manifest.json (or the file of the same name in --pdf-dir, given by the user). Rewrites only _work/source.txt,
     refs.md and manifest.json (recorded figures kept); never the translation or the images. Refuses a paper
     whose new page count differs from the old one (the anchors would no longer match)."""
+    import contextlib
+    import io
     import tempfile
     if not os.path.isdir(a.root):
         die(f"不是文件夹：{a.root}")
-    n = done = skipped = 0
+    n = done = skipped = failed = 0
     for name, folder in iter_papers(a.root):
         old = load_manifest(folder)
         if not old:
@@ -2769,38 +2804,45 @@ def cmd_refresh(a) -> int:
             print(f"[将重提] {name}  {tool} → pdftrans {VERSION}  （{pdf}）")
             continue
         with tempfile.TemporaryDirectory() as tmp:
-            import contextlib
-            import io
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                cmd_extract(argparse.Namespace(pdf=pdf, outdir=tmp))
+            try:  # extract reports through die() (SystemExit) and return codes; neither may end the batch
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc = cmd_extract(argparse.Namespace(pdf=pdf, outdir=tmp))
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 1
+            except Exception as e:  # a damaged PDF: report it and go on with the next paper
+                rc = 1
+                buf.write(f"\nERROR: {type(e).__name__}: {e}\n")
+            notes = [ln.strip() for ln in buf.getvalue().splitlines()
+                     if ln.startswith(("WARNING", "ERROR", "整份"))]
+            if rc:
+                print(f"[失败] {name}  重新提取出错（代码 {rc}），未改动" + "".join(f"\n    {x}" for x in notes))
+                failed += 1
+                continue
             new = load_manifest(tmp)
             if old.get("pages") and new.get("pages") != old.get("pages"):
                 print(f"[拒绝] {name}  新提取 {new.get('pages')} 页，原来 {old.get('pages')} 页：PDF 可能不是同一份，未改动")
                 skipped += 1
                 continue
             wd = work_dir(folder)
-            bdir = os.path.join(wd, "backup")
-            os.makedirs(bdir, exist_ok=True)
             for fn in ("source.txt", "refs.md", "manifest.json"):
-                src, bak = os.path.join(wd, fn), os.path.join(bdir, fn.replace(".", ".before-refresh.", 1))
-                if os.path.isfile(src) and not os.path.exists(bak):
-                    shutil.copyfile(src, bak)
+                backup_once(folder, os.path.join(wd, fn), fn.replace(".", ".before-refresh.", 1))
             new["figures"] = old.get("figures", [])
-            new["pdf"] = rec if rec and os.path.isfile(rec) else pdf
+            new["pdf"] = pdf
             for fn in ("source.txt", "refs.md"):
                 t = os.path.join(tmp, WORK, fn)
                 if os.path.isfile(t):
                     shutil.copyfile(t, os.path.join(wd, fn))
             save_manifest(folder, new)
         fixes = (new.get("symbol_fixes") or {}).get("count", 0)
-        print(f"[重提] {name}  {tool} → pdftrans {VERSION}；符号字体还原 {fixes} 处（旧文件在 _work/backup/）")
+        print(f"[重提] {name}  {tool} → pdftrans {VERSION}；符号字体还原 {fixes} 处（旧文件在 _work/backup/）"
+              + "".join(f"\n    {x}" for x in notes))
         done += 1
     if not n:
         die("没找到带 _work/manifest.json 的文献文件夹", 1)
     tail = "预览，未改动文件" if a.dry_run else f"重新提取 {done} 篇"
-    print(f"\n共 {n} 篇，{tail}" + (f"；跳过 {skipped} 篇" if skipped else ""))
-    return 0
+    print(f"\n共 {n} 篇，{tail}" + (f"；跳过 {skipped} 篇" if skipped else "") + (f"；失败 {failed} 篇" if failed else ""))
+    return 1 if failed else 0
 
 
 def cmd_selftest(a) -> int:
@@ -2829,6 +2871,8 @@ def wrap_line(ln: str) -> list:
         e = m.end()
         nxt = ln[e:].lstrip(" ")
         if BLOCK_START_RE.match(nxt):  # a line starting '1. ', '- ', '#', '>', '|' … would become another block
+            continue
+        if ABBREV_END_RE.search(ln[max(0, m.start() - 12):m.start() + 1]):  # 'et al.', 'Fig.': mid-sentence
             continue
         if e - last >= WRAP_TO and e < len(ln):
             cuts.append(e)
@@ -2869,11 +2913,11 @@ def cmd_wrap(a) -> int:
                 parts = wrap_line(ln)
                 if len(parts) > 1:
                     hits.append((i + doc["off"], len(ln), len(parts)))
-                elif len(ln) > LONG_LINE:
+                else:  # over WRAP_AT (the spec's limit for a paragraph line) and no sentence end to break at
                     skipped.append(f"L{i + doc['off']} 段落 {len(ln)} 字（找不到合适的句末）")
                 new += parts
             else:
-                if len(ln) > LONG_LINE:
+                if len(ln) > LINE_CUT:
                     why = {"table": "表格行", "item": "列表项", "code": "代码", "heading": "标题"}.get(kinds.get(i), "图注或其他")
                     skipped.append(f"L{i + doc['off']} {why} {len(ln)} 字")
                 new.append(ln)
@@ -2893,11 +2937,7 @@ def cmd_wrap(a) -> int:
             print(f"    编码规范化：{'、'.join(doc['normalized'])}（写入时一并生效）")
         if a.dry_run:
             continue
-        bdir = os.path.join(work_dir(folder), "backup")
-        os.makedirs(bdir, exist_ok=True)
-        bak = os.path.join(bdir, re.sub(r"\.md$", "", doc["name"]) + ".before-wrap.md")
-        if not os.path.exists(bak):
-            shutil.copyfile(doc["path"], bak)
+        backup_once(folder, doc["path"], re.sub(r"\.md$", "", doc["name"]) + ".before-wrap.md")
         prefix = doc["text"][:len(doc["text"]) - len(doc["body"])]
         write_atomic(doc["path"], prefix + "\n".join(new))
         changed += 1
@@ -2913,20 +2953,29 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n…（截断，另有 {len(text) - limit} 字）"
 
 
-def pair_view(name: str, folder: str, doc: dict, pages: list, p: int, limit: int) -> str:
+def pair_context(folder: str, doc: dict, pages: list) -> dict:
+    """Per-paper data pair_view needs, computed once however many pages are shown."""
+    blocks = md_blocks(doc["lines"])
+    slines = {}
+    with open(source_path(folder), encoding="utf-8", errors="replace") as fh:
+        for i, ln in enumerate(fh):
+            m = SRC_PAGE_RE.fullmatch(ln.strip())
+            if m:
+                slines.setdefault(int(m.group(1)), i + 1)
+    return {"clean": dict(strip_running(pages)), "slines": slines, "blocks": blocks,
+            "lp": line_pages(doc["lines"], blocks)}
+
+
+def pair_view(name: str, doc: dict, ctx: dict, p: int, limit: int) -> str:
     """Source page p (running headers/footers left out) next to the translation under the <!-- pN --> anchor,
     plus the paragraph that starts just before the anchor (a paragraph that begins on the previous page and
     runs onto this one is anchored there, so its second half belongs here)."""
-    clean, nrun = strip_running(pages)
-    src = dict(clean).get(p)
+    src = ctx["clean"].get(p)
     if src is None:
         return ""
-    sp = source_path(folder)
-    sline = next((i + 1 for i, ln in enumerate(open(sp, encoding="utf-8", errors="replace"))
-                  if SRC_PAGE_RE.fullmatch(ln.strip()) and int(SRC_PAGE_RE.fullmatch(ln.strip()).group(1)) == p), None)
+    sline = ctx["slines"].get(p)
     lines, off = doc["lines"], doc["off"]
-    blocks = md_blocks(lines)
-    lp = line_pages(lines, blocks)
+    blocks, lp = ctx["blocks"], ctx["lp"]
     body = [(s, e, k) for s, e, k in blocks if k not in ("blank", "anchor") and lp[s] == p]
     # the paragraph right before this page's text (figures, captions and tables in between are floats and are
     # skipped; a heading in between means nothing runs over)
@@ -2960,14 +3009,12 @@ def pair_view(name: str, folder: str, doc: dict, pages: list, p: int, limit: int
     return "\n".join(out)
 
 
-def sample_pages(name: str, doc: dict, pages: list, k: int, seed) -> list:
+def sample_pages(name: str, doc: dict, ctx: dict, pages: list, k: int, seed) -> list:
     """k body pages with real running text, before the reference list; reproducible for a given seed
     (default: derived from the paper's folder name, so the same pages come back every time)."""
     import random
     import zlib
-    lines = doc["lines"]
-    blocks = md_blocks(lines)
-    lp = line_pages(lines, blocks)
+    lines, blocks, lp = doc["lines"], ctx["blocks"], ctx["lp"]
     ref_page = None
     for s, e, kk in blocks:
         if kk == "heading" and REF_TITLE_RE.search(lines[s]) and lp[s]:
@@ -2993,21 +3040,22 @@ def cmd_pair(a) -> int:
         if not doc or doc["fatal"] or not pages:
             print(f"== {name} ==\n（{'没有译稿' if not doc else doc['fatal'] or '没有带分页标记的 source.txt'}）\n")
             continue
+        ctx = pair_context(folder, doc, pages)
         if a.page:
             want = [a.page]
         elif a.line:
             i = a.line - doc["off"]
-            lp = line_pages(doc["lines"])
+            lp = ctx["lp"]
             if not 0 <= i < len(lp) or lp[i] is None:
                 print(f"== {name} ==\n（第 {a.line} 行不在正文页码锚点范围内）\n")
                 continue
             want = [lp[i]]
         else:
-            want = sample_pages(name, doc, pages, a.sample, a.seed)
+            want = sample_pages(name, doc, ctx, pages, a.sample, a.seed)
         if not want:
             print(f"== {name} ==\n（没有正文足够长的页可抽）\n")
         for p in want:
-            v = pair_view(name, folder, doc, pages, p, a.max_chars)
+            v = pair_view(name, doc, ctx, p, a.max_chars)
             if not v:
                 print(f"== {name} · p{p} ==\n（原文没有第 {p} 页；共 {len(pages)} 页）\n")
                 continue

@@ -1,5 +1,45 @@
 # Changelog
 
+## v3.2.1
+
+Fixes from a second code review of v3.2 and from a test of the first fix build on the 38-paper library.
+Regression checks: 112 (`pdftrans selftest`; v3.2 shipped with 91).
+
+### Fixed
+
+- `refresh`: a PDF that `extract` cannot read (encrypted, damaged, no text layer) no longer stops the batch or
+  overwrites `source.txt`; it is reported as `[失败]` with extract's own warning, the next paper is processed,
+  and the exit code is 1. Extract warnings (scanned pages) are shown under `[重提]`.
+- Number check, fewer false passes: decimal commas are read only before a unit or ± (`[1,2]`, `refs 3,4` stay
+  lists); `gram-` + a word after a number (`Two gram-variable`, `5 Gram-negative`) is the Gram stain, not grams,
+  replacing the positive/negative/stain/scale word list (other units keep their hyphenated adjective:
+  `5 micron-thick`, `5- micron-thick`, `Four-micrometer-thick` are 5 μm / 5 μm / 4 μm); `10−3 mM`
+  and `1 × 10−3 mg` (true minus sign) are exponents, not `3 mM`/`3 mg` (`10-30 mM` with a hyphen is still a range).
+  In the source only a true minus sign blocks a number, so `top-2 mm, bottom-500 μm` and `CaO-5% P2O5` keep
+  their quantities (the first fix build also blocked the ASCII hyphen there and produced two false caption /
+  number warnings on the library).
+- Running lines: the 30% rule applies to a line with a changing number (page number), a year, a URL or
+  "et al."; a line with no digits needs 50%, as in v3.2; a line whose digits never change (`Day 7 group A`)
+  needs 70% 〔自订阈值〕, so a repeated figure label stays visible in `pair` and `find`. (Before, any digit made a
+  line "typical", and the first fix build raised digit-free footers such as `Paper RSC Advances` to 70% too.)
+- `wrap` does not break after abbreviations (`et al.`, `Fig.`, `e.g.`, `vs.` …), and the hard-wrap check no
+  longer treats a line ending in one as a finished sentence.
+- `wrap` lists every paragraph line over 1,500 characters it could not break (before, only those over 2,000;
+  `LONG_LINE` was defined twice, 1,500 and 2,000 — the 2,000 reader limit is now `LINE_CUT`).
+- The source snippet next to a number warning compares units by what they measure (mM with μM, not with mm).
+- `tests/test_pdftrans.py` ignores options (`-q`) and says so when the pdftrans.py path it is given does not exist.
+
+### Changed
+
+- `VERSION` 3.2.1: `refresh` without `--force` re-extracts `_work/` made by 3.2.
+- Internal: one backup helper for `anchor`/`wrap`/`refresh`; per-paper work in `pair` done once, not per page;
+  source snippets built only for the rows shown.
+
+Measured on an 18-paper copy of a library (实测, this build against v3.2): `check`, `check --json`,
+`pair --sample 3`, `find --in src`, `wrap --dry-run` and `anchor --dry-run` print byte-identical output.
+The (number, unit) pairs read from the sources: none added, 3 dropped, all exponents v3.2 misread
+(`3.3 × 10−3 MPa` as 3 MPa, `10−8 mol/L` as 8 mol, `mL−1, 30 min` as 1 min).
+
 ## v3.2
 
 From hands-on feedback on v3.0/v3.1 (the 38-paper, 851-page library). Every change measured read-only on a copy
