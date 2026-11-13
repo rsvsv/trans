@@ -11,3 +11,6 @@ _work/
 figures/
 cards.jsonl
 cards.md
+
+# the packaged skill is meant to be downloadable
+!dist/*.zip
